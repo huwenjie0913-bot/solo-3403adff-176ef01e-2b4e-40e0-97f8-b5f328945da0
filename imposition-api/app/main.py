@@ -16,8 +16,9 @@ from .schemas import JobSpec, LayoutSelector, PlanModel, PlansResponse
 app = FastAPI(
     title="印前拼版 API",
     description="小型印刷厂骑马订/胶装拼版方案生成：枚举开数与横竖放置、校验尺寸/咬口/纹向、"
+                "胶装支持固定帖与混合帖规划（多种帖页数组合配帖），"
                 "输出带裁切线/套准标记/帖码的拼版 PDF 与 JSON 工单。所有处理均在本地完成。",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 PT_PER_MM = 72.0 / 25.4
@@ -68,8 +69,13 @@ def _parse_spec(spec_json: str) -> JobSpec:
 
 
 def _pick_plan(plans: list[PlanModel], sel: LayoutSelector) -> PlanModel:
-    plan = find_plan(plans, sel.rotation, sel.cols, sel.rows)
+    plan = find_plan(plans, sel.rotation, sel.cols, sel.rows, sel.plan_id)
     if plan is None:
+        if sel.plan_id:
+            raise HTTPException(
+                404,
+                f"未找到候选 ID 为 “{sel.plan_id}” 的方案，请先调用 /api/plans 查看候选 ID",
+            )
         raise HTTPException(
             404,
             f"未找到匹配的方案 rotation={sel.rotation} cols={sel.cols} rows={sel.rows}，"
@@ -90,6 +96,8 @@ def _ticket(spec: JobSpec, source: dict, plan: PlanModel) -> dict:
             "页码为 null 的单元格为空白页",
             "rotation 为该页内容置入时的旋转角度（度）",
             "坐标原点在纸张左下角，单位 mm",
+            "混合帖方案见 plan.signature_plan：逐帖页码范围/容量/用纸/空白页位置/帖码，"
+            "配帖顺序与 PDF 阶梯帖码均按帖序号 1→N",
         ],
     }
 
@@ -116,6 +124,7 @@ async def list_plans(
 async def make_ticket(
     file: UploadFile = File(..., description="源 PDF"),
     spec: str = Form(...),
+    plan_id: str | None = Form(default=None, description="候选方案 ID（优先于开数选择器）"),
     rotation: int | None = Form(default=None),
     cols: int | None = Form(default=None),
     rows: int | None = Form(default=None),
@@ -127,7 +136,7 @@ async def make_ticket(
     plans, rejections = enumerate_plans(job, source["pages"])
     if not plans:
         raise HTTPException(422, {"message": "无可行方案", "reasons": [r.model_dump() for r in rejections]})
-    plan = _pick_plan(plans, LayoutSelector(rotation=rotation, cols=cols, rows=rows))
+    plan = _pick_plan(plans, LayoutSelector(plan_id=plan_id, rotation=rotation, cols=cols, rows=rows))
     return _ticket(job, source, plan)
 
 
@@ -135,6 +144,7 @@ async def make_ticket(
 async def make_pdf(
     file: UploadFile = File(..., description="源 PDF"),
     spec: str = Form(...),
+    plan_id: str | None = Form(default=None, description="候选方案 ID（优先于开数选择器）"),
     rotation: int | None = Form(default=None),
     cols: int | None = Form(default=None),
     rows: int | None = Form(default=None),
@@ -146,7 +156,7 @@ async def make_pdf(
     plans, rejections = enumerate_plans(job, source["pages"])
     if not plans:
         raise HTTPException(422, {"message": "无可行方案", "reasons": [r.model_dump() for r in rejections]})
-    plan = _pick_plan(plans, LayoutSelector(rotation=rotation, cols=cols, rows=rows))
+    plan = _pick_plan(plans, LayoutSelector(plan_id=plan_id, rotation=rotation, cols=cols, rows=rows))
     out = build_imposed_pdf(pdf_bytes, job, plan, source["has_bleed"])
     return Response(
         content=out,

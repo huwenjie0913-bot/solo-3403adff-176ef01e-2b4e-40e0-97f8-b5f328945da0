@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import math
+from itertools import groupby
 
 from .schemas import (
     BindingType,
@@ -24,9 +25,12 @@ from .schemas import (
     RejectionModel,
     SheetModel,
     SheetSide,
+    SignaturePart,
 )
 
 MAX_PAGES_PER_SIDE = 64  # 枚举上限，避免生成无意义的超小开数
+DEFAULT_MAX_SIGNATURES = 50  # 混合帖默认最大帖数
+_COMBO_NODE_BUDGET = 100_000  # 配帖组合枚举的节点预算（防止极端输入下组合爆炸）
 
 
 def grain_axis(spec: JobSpec) -> str:
@@ -187,7 +191,8 @@ def _cells(
 
 
 def _steps(spec: JobSpec, cols: int, rows: int, n_units: int,
-           signatures: int, units_per_sig: int, geo: dict) -> list[str]:
+           signatures: int, units_per_sig: int, geo: dict,
+           sig_sizes: list[int] | None = None) -> list[str]:
     """裁切折叠顺序：先外部裁切分离纸边与单元，再沿书脊中线折叠。"""
     v, h = cut_counts(cols, rows)
     ext = "、".join(f"{x:g}" for x in geo["ext_v"])
@@ -214,40 +219,152 @@ def _steps(spec: JobSpec, cols: int, rows: int, n_units: int,
         )
         steps.append("装订：沿书脊骑马钉 2~3 钉，三面裁切成品")
     else:
-        steps.append(
-            f"成帖：每帖 {units_per_sig} 个折页单元按编号顺序叠放，"
-            f"裁切全部完成后沿书脊中线（x={fold}mm）对折成帖"
-            f"（每帖 {spec.pages_per_signature} 页）"
-        )
-        steps.append(
-            f"配帖：共 {signatures} 帖，按帖码 1→{signatures} 顺序配帖"
-            "（核对书脊处阶梯帖码标记）"
-        )
+        if sig_sizes is not None:
+            desc = _composition_desc(sig_sizes)
+            steps.append(
+                f"成帖：各帖按自身折页单元数叠放（{desc}，每单元 4 页），"
+                f"裁切全部完成后沿书脊中线（x={fold}mm）对折成帖"
+            )
+            steps.append(
+                f"配帖：共 {signatures} 帖（{desc}），按帖码 1→{signatures} 顺序配帖"
+                "（核对书脊处阶梯帖码标记），空白页集中在末帖"
+            )
+        else:
+            steps.append(
+                f"成帖：每帖 {units_per_sig} 个折页单元按编号顺序叠放，"
+                f"裁切全部完成后沿书脊中线（x={fold}mm）对折成帖"
+                f"（每帖 {spec.pages_per_signature} 页）"
+            )
+            steps.append(
+                f"配帖：共 {signatures} 帖，按帖码 1→{signatures} 顺序配帖"
+                "（核对书脊处阶梯帖码标记）"
+            )
         steps.append("装订：铣背/锁线后刷胶，包封面，三面裁切成品")
     return steps
 
 
+def _mixed_combos(total_pages: int, sizes: list[int], max_sigs: int,
+                  max_blanks: int | None) -> list[tuple[int, ...]]:
+    """枚举可行的混合帖组合，返回帖页数降序元组列表（大帖在前、末帖最小）。
+
+    约束：容量 ≥ 实际页数；帖数 ≤ max_sigs；空白页 = 容量 - 实际页数 ≤ max_blanks（若设置）；
+    空白全部落在末帖——空白数 < 最小帖页数（末帖至少 1 个真实页，前帖不含空白）。
+    """
+    sizes = sorted(set(sizes), reverse=True)
+    blank_hi = sizes[0] - 1 if max_blanks is None else min(max_blanks, sizes[0] - 1)
+    hi = total_pages + blank_hi  # 容量上界（末帖至少 1 个真实页，空白必小于最大帖）
+    combos: list[tuple[int, ...]] = []
+    nodes = 0
+
+    def rec(prefix: list[int], total: int, start: int) -> None:
+        nonlocal nodes
+        if nodes >= _COMBO_NODE_BUDGET:
+            return
+        nodes += 1
+        if total >= total_pages:
+            if total - total_pages < prefix[-1]:
+                combos.append(tuple(prefix))
+            return  # 再加帖只会增大空白且最小帖不增，必然违反末帖约束
+        if len(prefix) >= max_sigs:
+            return
+        for i in range(start, len(sizes)):
+            if total + sizes[i] > hi:
+                continue  # 更小的帖仍可能不超上界
+            rec(prefix + [sizes[i]], total + sizes[i], i)
+
+    rec([], 0, 0)
+    return combos
+
+
+def _min_blanks(total_pages: int, sizes: list[int], max_sigs: int) -> int | None:
+    """不考虑空白上限时最小可实现的空白页数（含末帖约束）；无解返回 None。
+
+    对每种"最小帖 s"做背包 DP：用 ≥s 的帖型、≤max_sigs 帖凑出容量 ∈ [total, total+s-1]，
+    且至少含一个 s（保证空白全部落在末帖）。
+    """
+    best: int | None = None
+    for s in sizes:
+        others = [p for p in sizes if p > s]
+        hi = total_pages + s - 1
+        INF = max_sigs + 1
+        dp = [INF] * (hi + 1)   # 不用 s 凑出该容量的最少帖数
+        dp2 = [INF] * (hi + 1)  # 至少用一个 s 的最少帖数
+        dp[0] = 0
+        for c in range(1, hi + 1):
+            for p in others:
+                if c >= p and dp[c - p] + 1 < dp[c]:
+                    dp[c] = dp[c - p] + 1
+            cand = []
+            if c >= s:
+                cand += [dp[c - s] + 1, dp2[c - s] + 1]
+            for p in others:
+                if c >= p:
+                    cand.append(dp2[c - p] + 1)
+            if cand:
+                dp2[c] = min(cand)
+        for c in range(total_pages, hi + 1):
+            if dp2[c] <= max_sigs and (best is None or c - total_pages < best):
+                best = c - total_pages
+    return best
+
+
+def _mixed_conflict_reason(total_pages: int, sizes: list[int], max_sigs: int,
+                           max_blanks: int | None) -> str:
+    """混合帖无解时指出冲突的约束。"""
+    cap_max = max_sigs * sizes[0]
+    if cap_max < total_pages:
+        return (f"实际 {total_pages} 页超过容量上限：最大帖数 {max_sigs} × 最大帖页数 {sizes[0]} "
+                f"= {cap_max} 页（冲突约束：max_signatures 或 allowed_signature_pages 过小，"
+                "请放宽帖数上限或增加更大的帖页数）")
+    best = _min_blanks(total_pages, sizes, max_sigs)
+    return (f"最小可实现空白页数为 {best}，超过空白页上限 {max_blanks}"
+            f"（冲突约束：max_blank_pages 过小，请放宽到 ≥{best} 或调整 allowed_signature_pages）")
+
+
+def _composition_desc(sig_sizes: list[int]) -> str:
+    """配帖构成描述，如 '16页×3帖＋8页×1帖'（sig_sizes 已降序）。"""
+    return "＋".join(f"{s}页×{len(list(g))}帖" for s, g in groupby(sig_sizes))
+
+
+def _mix_id_suffix(sig_sizes: list[int]) -> str:
+    """方案 ID 的配帖构成段，如 '16x3+8'。"""
+    parts = []
+    for s, g in groupby(sig_sizes):
+        n = len(list(g))
+        parts.append(f"{s}x{n}" if n > 1 else str(s))
+    return "+".join(parts)
+
+
 def _build_plan(spec: JobSpec, total_pages: int, rotation: int,
-                cols: int, rows: int) -> PlanModel | None:
+                cols: int, rows: int, sig_sizes: list[int] | None = None) -> PlanModel | None:
+    """构建一个方案。sig_sizes 为混合帖各帖页数（降序）；None 表示骑马订/固定帖。"""
     fw, fh = spec.finished_width, spec.finished_height
     cw, ch = (fw, fh) if rotation == 0 else (fh, fw)
     n_units = (cols // 2) * rows
 
+    # 逐帖定义：(帖页数, 帖首 base, 帖内张数)
     if spec.binding == BindingType.saddle:
         units_needed = math.ceil(total_pages / 4)
         sheets_total = math.ceil(units_needed / n_units)
-        signatures, sheets_per_sig = 1, sheets_total
-        sig_pages = sheets_total * n_units * 4  # 整册即一"帖"
+        sig_defs = [(sheets_total * n_units * 4, 0, sheets_total)]  # 整册即一"帖"
+    elif sig_sizes is not None:
+        sig_defs = []
+        base = 0
+        for size in sig_sizes:  # 各帖页数已保证为单张纸容量（n_units×4 页）的整数倍
+            sig_defs.append((size, base, size // (n_units * 4)))
+            base += size
     else:
         sig_pages = spec.pages_per_signature
         units_per_sig = sig_pages // 4
         if units_per_sig % n_units != 0:
             return None  # 每帖页数不是每张纸单元数的整数倍，由调用方给出原因
         sheets_per_sig = units_per_sig // n_units
-        signatures = math.ceil(total_pages / sig_pages)
-        sheets_total = signatures * sheets_per_sig
+        sig_defs = [(sig_pages, i * sig_pages, sheets_per_sig)
+                    for i in range(math.ceil(total_pages / sig_pages))]
 
-    capacity = signatures * sig_pages
+    signatures = len(sig_defs)
+    sheets_total = sum(d[2] for d in sig_defs)
+    capacity = sum(d[0] for d in sig_defs)
     blanks = list(range(total_pages + 1, capacity + 1))
 
     px0, py0, pw, ph = printable_area(spec)
@@ -258,23 +375,41 @@ def _build_plan(spec: JobSpec, total_pages: int, rotation: int,
     oy = py0 + (ph - foot_h) / 2
 
     sheets: list[SheetModel] = []
-    for s in range(sheets_total):
-        sig_idx, s_in_sig = divmod(s, sheets_per_sig)
-        base = sig_idx * sig_pages
-        first_unit = s_in_sig * n_units
-        front_g, back_g = _grid_pages(
-            spec, total_pages, sig_pages, base, first_unit, n_units, cols, rows)
-        sheets.append(SheetModel(
-            index=s + 1, signature=sig_idx + 1, sheet_in_signature=s_in_sig + 1,
-            front=SheetSide(cells=_cells(spec, front_g, cols, rows, cw, ch, ox, oy, rotation, False)),
-            back=SheetSide(cells=_cells(spec, back_g, cols, rows, cw, ch, ox, oy, rotation, True)),
-        ))
+    for sig_i, (sig_pages, base, n_sheets) in enumerate(sig_defs):
+        for s_in_sig in range(n_sheets):
+            first_unit = s_in_sig * n_units
+            front_g, back_g = _grid_pages(
+                spec, total_pages, sig_pages, base, first_unit, n_units, cols, rows)
+            sheets.append(SheetModel(
+                index=len(sheets) + 1, signature=sig_i + 1, sheet_in_signature=s_in_sig + 1,
+                front=SheetSide(cells=_cells(spec, front_g, cols, rows, cw, ch, ox, oy, rotation, False)),
+                back=SheetSide(cells=_cells(spec, back_g, cols, rows, cw, ch, ox, oy, rotation, True)),
+            ))
+
+    # 混合帖逐帖明细：页码范围、容量、用纸数、空白页位置、帖码
+    signature_plan: list[SignaturePart] | None = None
+    sig_types, sig_spread = 1, 0
+    if sig_sizes is not None:
+        sig_types = len(set(sig_sizes))
+        sig_spread = max(sig_sizes) - min(sig_sizes)
+        signature_plan = []
+        for sig_i, (sig_pages, base, n_sheets) in enumerate(sig_defs):
+            lo, hi_p = base + 1, base + sig_pages
+            signature_plan.append(SignaturePart(
+                index=sig_i + 1, pages=sig_pages, start_page=lo, end_page=hi_p,
+                sheets=n_sheets,
+                blanks=[p for p in blanks if lo <= p <= hi_p],
+                mark=f"帖{sig_i + 1}/{signatures}",
+            ))
 
     v_cuts, h_cuts = cut_counts(cols, rows)
-    units_per_sig = sheets_per_sig * n_units
+    sheets_per_sig = max(d[2] for d in sig_defs)
     geo = compute_mark_geometry(spec, sheets[0].front.cells)
+    plan_id = f"rot{rotation}-{cols}x{rows}"
+    if sig_sizes is not None:
+        plan_id += f"-mix{_mix_id_suffix(sig_sizes)}"
     return PlanModel(
-        id=f"rot{rotation}-{cols}x{rows}",
+        id=plan_id,
         binding=spec.binding, rotation=rotation, cols=cols, rows=rows,
         pages_per_side=cols * rows, units_per_sheet=n_units,
         sheets_total=sheets_total, signatures=signatures,
@@ -283,7 +418,10 @@ def _build_plan(spec: JobSpec, total_pages: int, rotation: int,
         cuts_per_sheet=v_cuts + h_cuts,
         grain_parallel_to_spine=True,
         printable_width_mm=pw, printable_height_mm=ph,
-        steps=_steps(spec, cols, rows, n_units, signatures, units_per_sig, geo),
+        signature_types=sig_types, signature_spread=sig_spread,
+        signature_plan=signature_plan,
+        steps=_steps(spec, cols, rows, n_units, signatures,
+                     sheets_per_sig * n_units, geo, sig_sizes),
         sheets=sheets,
     )
 
@@ -326,31 +464,71 @@ def enumerate_plans(spec: JobSpec, total_pages: int) -> tuple[list[PlanModel], l
             rows = 1
             while (cols * rows <= MAX_PAGES_PER_SIDE
                    and grid_footprint(cols, rows, cw, ch, b)[1] <= ph):
-                plan = _build_plan(spec, total_pages, rotation, cols, rows)
-                if plan is None:
-                    rejections.append(RejectionModel(
-                        layout=f"{orient} {cols}×{rows}（每面 {cols * rows} 页）",
-                        reason=f"胶装每帖 {spec.pages_per_signature} 页 = "
-                               f"{spec.pages_per_signature // 4} 个折页单元，不是每张纸 "
-                               f"{(cols // 2) * rows} 个单元的整数倍；"
-                               f"请调整每帖页数（如 {(cols // 2) * rows * 4} 的倍数）",
-                    ))
+                layout = f"{orient} {cols}×{rows}（每面 {cols * rows} 页）"
+                n_units = (cols // 2) * rows
+                if spec.mixed_signatures:
+                    # 混合帖：各帖页数须为 4 的倍数且被单张纸容量整除
+                    cap_sheet = n_units * 4
+                    sizes = [p for p in spec.allowed_signature_pages if p % cap_sheet == 0]
+                    if not sizes:
+                        rejections.append(RejectionModel(
+                            layout=layout,
+                            reason=f"允许的每帖页数 {spec.allowed_signature_pages} 均不是当前开数"
+                                   f"单张纸容量 {cap_sheet} 页（{n_units} 单元 × 4 页）的整数倍"
+                                   f"（冲突约束：allowed_signature_pages 需包含 {cap_sheet} 的倍数）",
+                        ))
+                    else:
+                        max_sigs = spec.max_signatures or DEFAULT_MAX_SIGNATURES
+                        combos = _mixed_combos(total_pages, sizes, max_sigs,
+                                               spec.max_blank_pages)
+                        if not combos:
+                            rejections.append(RejectionModel(
+                                layout=layout,
+                                reason=_mixed_conflict_reason(
+                                    total_pages, sizes, max_sigs, spec.max_blank_pages),
+                            ))
+                        else:
+                            # 与本方案排序同键预排序，每个开数只保留前 max_layouts 个候选
+                            combos.sort(key=lambda c: (sum(c), len(set(c)),
+                                                       max(c) - min(c), len(c)))
+                            for combo in combos[: spec.max_layouts]:
+                                plans.append(_build_plan(spec, total_pages, rotation,
+                                                         cols, rows, list(combo)))
                 else:
-                    plans.append(plan)
+                    plan = _build_plan(spec, total_pages, rotation, cols, rows)
+                    if plan is None:
+                        rejections.append(RejectionModel(
+                            layout=layout,
+                            reason=f"胶装每帖 {spec.pages_per_signature} 页 = "
+                                   f"{spec.pages_per_signature // 4} 个折页单元，不是每张纸 "
+                                   f"{n_units} 个单元的整数倍；"
+                                   f"请调整每帖页数（如 {n_units * 4} 的倍数）",
+                        ))
+                    else:
+                        plans.append(plan)
                 rows += 1
             cols += 2  # 列数必须为偶数，折页单元才能成对
 
     if not plans and not rejections:
         rejections.append(RejectionModel(layout="-", reason="无可枚举的开数"))
 
-    # 排序：纸张用量 → 空白页数 → 裁切刀数 → 每面页数（大开数优先）
-    plans.sort(key=lambda p: (p.sheets_total, p.blank_pages, p.cuts_per_sheet, -p.pages_per_side))
+    # 排序：总用纸 → 空白页 → 帖型数量 → 各帖页数差 → 帖数 → 裁切刀数 → 每面页数（大开数优先）
+    # （非混合帖模式下帖型数量/页数差/帖数为常量，排序行为与之前一致）
+    plans.sort(key=lambda p: (p.sheets_total, p.blank_pages, p.signature_types,
+                              p.signature_spread, p.signatures,
+                              p.cuts_per_sheet, -p.pages_per_side))
     return plans[: spec.max_layouts], rejections
 
 
-def find_plan(plans: list[PlanModel], rotation: int | None,
-              cols: int | None, rows: int | None) -> PlanModel | None:
+def find_plan(plans: list[PlanModel], rotation: int | None = None,
+              cols: int | None = None, rows: int | None = None,
+              plan_id: str | None = None) -> PlanModel | None:
+    """按候选 ID 或开数选择器查找方案；均不指定时返回排序后的第一个。"""
     for p in plans:
+        if plan_id is not None:
+            if p.id == plan_id:
+                return p
+            continue
         if rotation is not None and p.rotation != rotation:
             continue
         if cols is not None and p.cols != cols:

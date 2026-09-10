@@ -196,9 +196,153 @@ fit = {**over, "sheet_width": 230, "sheet_height": 170}
 r = post("/api/plans", src, fit)
 check("临界可行方案被接受", len(r.json()["plans"]) > 0)
 
+print("== 6. 胶装混合帖：50 页 / 允许 16、8 页帖 ==")
+src50 = make_sample(50, out="/tmp/sample50.pdf")
+spec_mix = {**SPEC_BASE, "binding": "perfect",
+            "allowed_signature_pages": [16, 8], "max_signatures": 10}
+r = post("/api/plans", src50, spec_mix)
+check("混合帖 plans 200", r.status_code == 200, r.text[:300])
+body = r.json()
+check("混合帖有可行方案", len(body["plans"]) > 0)
+ids = [p["id"] for p in body["plans"]]
+check("候选 ID 唯一", len(set(ids)) == len(ids))
+best_m = body["plans"][0]
+print(f"  最优混合方案: {best_m['id']} 用纸{best_m['sheets_total']}张 "
+      f"{best_m['signatures']}帖 空白{best_m['blank_pages']}页 "
+      f"帖型{best_m['signature_types']}种 页数差{best_m['signature_spread']}")
+# 50 页、8页/张容量：最优为 7 帖×8 页（容量 56、空白 6、单一帖型）
+check("最优候选 ID", best_m["id"] == "rot0-2x2-mix8x7", best_m["id"])
+check("最优用纸 7 张", best_m["sheets_total"] == 7)
+check("容量 56 空白 6", best_m["capacity_pages"] == 56 and best_m["blank_pages"] == 6)
+check("帖型 1 种页数差 0", best_m["signature_types"] == 1 and best_m["signature_spread"] == 0)
+sp = best_m["signature_plan"]
+check("候选含逐帖明细", sp is not None and len(sp) == best_m["signatures"])
+check("逐帖页码范围连续覆盖", sp[0]["start_page"] == 1
+      and all(sp[i]["end_page"] + 1 == sp[i + 1]["start_page"] for i in range(len(sp) - 1))
+      and sp[-1]["end_page"] == best_m["capacity_pages"])
+check("各帖页数为 4 的倍数且被单张容量整除",
+      all(p["pages"] % 4 == 0 and p["pages"] % (best_m["units_per_sheet"] * 4) == 0 for p in sp))
+check("逐帖用纸合计=总用纸", sum(p["sheets"] for p in sp) == best_m["sheets_total"])
+check("空白页全部在末帖", best_m["blanks"] == sp[-1]["blanks"]
+      and all(p["blanks"] == [] for p in sp[:-1]))
+check("末帖至少 1 个真实页", sp[-1]["start_page"] <= 50)
+check("帖码与配帖顺序一致",
+      [p["mark"] for p in sp] == [f"帖{i + 1}/{len(sp)}" for i in range(len(sp))])
+check("混合方案排序=总用纸→空白→帖型→页数差",
+      body["plans"] == sorted(body["plans"], key=lambda p: (
+          p["sheets_total"], p["blank_pages"], p["signature_types"], p["signature_spread"],
+          p["signatures"], p["cuts_per_sheet"], -p["pages_per_side"])))
+
+# 多帖型候选：16页×3帖＋8页×1帖
+mix = next((p for p in body["plans"] if p["id"] == "rot0-2x2-mix16x3+8"), None)
+check("多帖型候选存在", mix is not None)
+parts = mix["signature_plan"]
+check("逐帖页数 16/16/16/8", [p["pages"] for p in parts] == [16, 16, 16, 8])
+check("逐帖用纸 2/2/2/1", [p["sheets"] for p in parts] == [2, 2, 2, 1])
+check("末帖页码范围 49-56", parts[-1]["start_page"] == 49 and parts[-1]["end_page"] == 56)
+check("末帖空白 51-56", parts[-1]["blanks"] == [51, 52, 53, 54, 55, 56])
+check("前帖无空白", all(p["blanks"] == [] for p in parts[:-1]))
+
+# 按候选 ID 出工单：页码网格按各帖容量生成，末帖空白不挤入前帖
+r = post("/api/ticket", src50, spec_mix, {"plan_id": "rot0-2x2-mix16x3+8"})
+check("按候选 ID 出工单", r.status_code == 200, r.text[:200])
+tk = r.json()
+check("工单方案=指定候选", tk["plan"]["id"] == "rot0-2x2-mix16x3+8")
+sig_seq = [s["signature"] for s in tk["sheets"]]
+check("工单配帖顺序 1,1,2,2,3,3,4", sig_seq == [1, 1, 2, 2, 3, 3, 4], str(sig_seq))
+front_cells = [c for s in tk["sheets"] if s["signature"] < 4
+               for c in s["front"]["cells"] + s["back"]["cells"]]
+check("前帖页码网格无空白格", all(c["page"] is not None for c in front_cells))
+last_cells = [c for s in tk["sheets"] if s["signature"] == 4
+              for c in s["front"]["cells"] + s["back"]["cells"]]
+sig4_pages = sorted(c["page"] for c in last_cells if c["page"] is not None)
+check("末帖真实页仅 49、50", sig4_pages == [49, 50], str(sig4_pages))
+check("末帖含 6 个空白格", sum(1 for c in last_cells if c["page"] is None) == 6)
+steps_mix = tk["steps"]
+gather = next(s for s in steps_mix if s.startswith("配帖"))
+check("工单配帖步骤含构成与帖码顺序",
+      "16页×3帖" in gather and "8页×1帖" in gather and "1→4" in gather, gather[:80])
+
+# 按候选 ID 出 PDF：阶梯帖码/逐帖张数标注与候选一致
+r = post("/api/pdf", src50, spec_mix, {"plan_id": "rot0-2x2-mix16x3+8"})
+check("混合帖 pdf 200", r.status_code == 200, r.text[:200])
+out = PdfReader(io.BytesIO(r.content))
+check("PDF 页数=用纸×2", len(out.pages) == 14, str(len(out.pages)))
+first_text = out.pages[0].extract_text()
+check("首张标注 帖1/4·16页", "1/4" in first_text and "16页" in first_text, first_text[:60])
+last_text = out.pages[-1].extract_text()
+check("末张标注 帖4/4·8页", "4/4" in last_text and "8页" in last_text, last_text[:60])
+check("末张张号分母=末帖张数 1/1", "1/1" in last_text)
+open("/tmp/imposed_mix.pdf", "wb").write(r.content)
+
+print("== 7. 混合帖无解：指出冲突约束 ==")
+src100 = make_sample(100, out="/tmp/sample100.pdf")
+# 帖数上限过小：100 页 > 3 帖 × 16 页 = 48 页容量
+few = {**SPEC_BASE, "binding": "perfect",
+       "allowed_signature_pages": [16], "max_signatures": 3}
+r = post("/api/plans", src100, few)
+body = r.json()
+check("帖数不足无解", len(body["plans"]) == 0 and len(body["rejections"]) > 0)
+rej_text = json.dumps(body["rejections"], ensure_ascii=False)
+check("指出 max_signatures 冲突", "max_signatures" in rej_text and "最大帖数" in rej_text)
+print(f"  原因示例: {body['rejections'][0]['reason']}")
+r = post("/api/ticket", src100, few)
+check("无解 ticket 返回 422", r.status_code == 422)
+
+# 空白页上限过小：50 页只用 16 页帖 → 最小空白 14 > 4
+tight = {**SPEC_BASE, "binding": "perfect",
+         "allowed_signature_pages": [16], "max_blank_pages": 4}
+r = post("/api/plans", src50, tight)
+body = r.json()
+rej_text = json.dumps(body["rejections"], ensure_ascii=False)
+check("空白上限过小无解", len(body["plans"]) == 0 and len(body["rejections"]) > 0)
+check("指出 max_blank_pages 冲突及最小空白 14",
+      "max_blank_pages" in rej_text and "14" in rej_text)
+print(f"  原因示例: {body['rejections'][0]['reason']}")
+
+# 帖页数不被单张容量整除：12 页帖在 8 页/张开数不可行，在 4/12 页/张开数可行
+# （短边纹使 rot90 开数可用，其中 2×3 开数单张容量恰为 12 页）
+odd = {**SPEC_BASE, "binding": "perfect", "allowed_signature_pages": [12],
+       "grain": "short_edge"}
+r = post("/api/plans", src40, odd)
+body = r.json()
+check("12页帖有可行开数", len(body["plans"]) > 0)
+check("最优为 12 页/张开数", body["plans"][0]["units_per_sheet"] * 4 == 12,
+      f"units={body['plans'][0]['units_per_sheet']}")
+check("最优方案容量 48 空白 8", body["plans"][0]["capacity_pages"] == 48
+      and body["plans"][0]["blank_pages"] == 8)
+rej_text = json.dumps(body["rejections"], ensure_ascii=False)
+check("不整除的开数给出原因", "单张纸容量" in rej_text)
+print(f"  原因示例: {body['rejections'][0]['reason']}")
+
+print("== 8. 混合帖参数校验与兼容性 ==")
+bad = {**SPEC_BASE, "binding": "perfect", "allowed_signature_pages": [10]}
+r = post("/api/plans", src40, bad)
+check("非4倍数帖页数返回 422", r.status_code == 422)
+bad2 = {**SPEC_BASE, "binding": "perfect", "allowed_signature_pages": []}
+r = post("/api/plans", src40, bad2)
+check("空候选列表返回 422", r.status_code == 422)
+# 骑马订忽略混合帖字段
+saddle_mix = {**SPEC_BASE, "binding": "saddle",
+              "allowed_signature_pages": [8, 16], "max_signatures": 2}
+r = post("/api/plans", src, saddle_mix)
+check("骑马订忽略混合帖字段", r.status_code == 200
+      and r.json()["plans"][0]["sheets_total"] == 4)
+# 未设置 allowed_signature_pages 时保持固定帖行为
+r = post("/api/plans", src40, spec_p)
+body = r.json()
+check("固定帖行为保留", body["plans"][0]["capacity_pages"] % 16 == 0
+      and body["plans"][0]["signature_plan"] is None)
+# 现有开数选择器在混合帖模式仍可用
+r = post("/api/ticket", src50, spec_mix, {"rotation": 0, "cols": 2, "rows": 2})
+check("混合帖模式兼容开数选择器", r.status_code == 200
+      and r.json()["plan"]["rotation"] == 0 and r.json()["plan"]["cols"] == 2)
+r = post("/api/ticket", src50, spec_mix, {"plan_id": "no-such-plan"})
+check("不存在的候选 ID 返回 404", r.status_code == 404)
+
 
 print()
 if failures:
     print(f"共 {len(failures)} 项失败: {failures}")
     sys.exit(1)
-print("全部通过 ✔  样例输出: /tmp/imposed_saddle.pdf, /tmp/imposed_perfect.pdf")
+print("全部通过 ✔  样例输出: /tmp/imposed_saddle.pdf, /tmp/imposed_perfect.pdf, /tmp/imposed_mix.pdf")

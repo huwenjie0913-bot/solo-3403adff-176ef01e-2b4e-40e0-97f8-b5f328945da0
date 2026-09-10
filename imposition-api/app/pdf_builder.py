@@ -107,11 +107,16 @@ def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
             c.rect(gx0 - _pt(2), y, _pt(1.5), bh, stroke=0, fill=1)
 
     # 文字标注：帖号/张号/正反面/开数 + 标线图例（先外部裁切、再沿中线折叠）
+    # 张号分母按本帖实际张数（混合帖各帖张数不同）；混合帖标注本帖页数
     c.setFillGray(0)
     c.setFont(CJK, 7)
     side_cn = "正面" if side_name == "F" else "背面"
-    label = (f"帖 {sheet.signature}/{plan.signatures}  "
-             f"张 {sheet.sheet_in_signature}/{plan.sheets_per_signature}  "
+    sig_sheet_total = sum(1 for s in plan.sheets if s.signature == sheet.signature)
+    sig_desc = ""
+    if plan.signature_plan:
+        sig_desc = f"·{plan.signature_plan[sheet.signature - 1].pages}页"
+    label = (f"帖 {sheet.signature}/{plan.signatures}{sig_desc}  "
+             f"张 {sheet.sheet_in_signature}/{sig_sheet_total}  "
              f"{side_cn}  {plan.cols}×{plan.rows}开 rot{plan.rotation}  "
              f"flip={spec.flip.value}；实线=外部裁切 虚线=废边裁切 "
              f"点划线=折叠（先外部裁切，再沿中线折叠，中线禁裁）")
