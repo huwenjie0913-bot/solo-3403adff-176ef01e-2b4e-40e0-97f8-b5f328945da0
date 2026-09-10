@@ -8,6 +8,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen import canvas
 
+from .engine import compute_mark_geometry  # 共享几何：工单与 PDF 标线一致
 from .schemas import CellModel, JobSpec, PlanModel, SheetModel
 
 MM = 72.0 / 25.4
@@ -19,46 +20,6 @@ CJK = "STSong-Light"
 
 def _pt(v_mm: float) -> float:
     return v_mm * MM
-
-
-def compute_mark_geometry(side_cells: list[CellModel]) -> dict:
-    """由工单单元格 trim 位置计算标线几何（mm），工单与 PDF 共用，保证一致。
-
-    - fold_v：折页单元书脊中线（仅为折叠线，绝不作为裁切线）；
-    - cut_v / cut_h：单元之间的裁切线（出血>0 时每个间隔两条，中间为废边）；
-    - bbox：拼版区 trim 外框（四角裁切角线位置）。
-    """
-    cw = side_cells[0].w_mm
-    ch = side_cells[0].h_mm
-    lefts = {cell.col: cell.x_mm for cell in side_cells}   # 各列 trim 左缘
-    bottoms = {cell.row: cell.y_mm for cell in side_cells}  # 各行 trim 下缘
-    cols = sorted(lefts)
-    rows = sorted(bottoms)
-
-    # 单元中线 = 奇数列（单元右格）的 trim 左缘
-    fold_v = sorted({lefts[c] for c in cols if c % 2 == 1})
-
-    # 单元间隔处的裁切线：左单元 trim 右缘 + 右单元 trim 左缘（出血为 0 时重合去重）
-    cut_v: list[float] = []
-    unit_cols = [c for c in cols if c % 2 == 0]
-    for lc, nc in zip(unit_cols, unit_cols[1:]):
-        cut_v.append(lefts[lc + 1] + cw)  # 左单元右缘
-        cut_v.append(lefts[nc])           # 右单元左缘
-    cut_v = sorted(set(round(x, 3) for x in cut_v))
-
-    cut_h: list[float] = []
-    for lower, upper in zip(rows, rows[1:]):
-        cut_h.append(bottoms[lower] + ch)  # 下行 trim 上缘
-        cut_h.append(bottoms[upper])       # 上行 trim 下缘
-    cut_h = sorted(set(round(y, 3) for y in cut_h))
-
-    return {
-        "fold_v": fold_v,
-        "cut_v": cut_v,
-        "cut_h": cut_h,
-        "bbox": (min(lefts.values()), min(bottoms.values()),
-                 max(lefts.values()) + cw, max(bottoms.values()) + ch),
-    }
 
 
 def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
@@ -89,7 +50,7 @@ def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
         c.rect(sw - g, 0, g, sh, stroke=0, fill=1)
 
     if side_cells:
-        geo = compute_mark_geometry(side_cells)
+        geo = compute_mark_geometry(spec, side_cells)
         gx0, gy0, gx1, gy1 = (_pt(v) for v in geo["bbox"])
 
         # 外框四角裁切角线（trim corner ticks）
@@ -100,7 +61,14 @@ def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
                 c.line(cx + sx * off, cy, cx + sx * (off + tick), cy)
                 c.line(cx, cy + sy * off, cx, cy + sy * (off + tick))
 
-        # 单元间裁切线（虚线，贯通整个拼版区；书脊中线绝不画裁切线）
+        # 纵向外部裁切线（实线，贯通全纸；先外部裁切、再折叠）
+        c.setLineWidth(0.8)
+        for x in geo["ext_v"]:
+            xp = _pt(x)
+            c.line(xp, 0, xp, sh)
+        c.setLineWidth(0.4)
+
+        # 单元间/行间废边裁切线（虚线，贯通整个拼版区；书脊中线绝不画裁切线）
         c.setDash([4, 3], 0)
         for x in geo["cut_v"]:
             xp = _pt(x)
@@ -138,14 +106,15 @@ def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
             c.setFillGray(0)
             c.rect(gx0 - _pt(2), y, _pt(1.5), bh, stroke=0, fill=1)
 
-    # 文字标注：帖号/张号/正反面/开数
+    # 文字标注：帖号/张号/正反面/开数 + 标线图例（先外部裁切、再沿中线折叠）
     c.setFillGray(0)
     c.setFont(CJK, 7)
     side_cn = "正面" if side_name == "F" else "背面"
     label = (f"帖 {sheet.signature}/{plan.signatures}  "
              f"张 {sheet.sheet_in_signature}/{plan.sheets_per_signature}  "
              f"{side_cn}  {plan.cols}×{plan.rows}开 rot{plan.rotation}  "
-             f"flip={spec.flip.value}")
+             f"flip={spec.flip.value}；实线=外部裁切 虚线=废边裁切 "
+             f"点划线=折叠（先外部裁切，再沿中线折叠，中线禁裁）")
     c.drawString(_pt(8), _pt(spec.gripper) + _pt(2) if edge == "bottom" else _pt(2), label)
 
     c.showPage()

@@ -62,15 +62,61 @@ def grid_footprint(cols: int, rows: int, cw: float, ch: float, bleed: float) -> 
     return w, h
 
 
-def cut_line_counts(cols: int, rows: int, bleed: float) -> tuple[int, int]:
-    """每张纸的裁切刀数（纵, 横）。书脊中线是折叠线，不计入裁切。
+def cut_counts(cols: int, rows: int) -> tuple[int, int]:
+    """每张纸的裁切刀数（纵, 横）。书脊中线是折叠线，绝不计入裁切。
 
-    出血 > 0 时单元间隔为 2×出血的废边，需两刀剔除；出血为 0 时合一刀。
+    纵向 = 单元间废边槽数 + 1 条外部裁切线（版面靠侧规边对齐，右侧分离纸边）；
+    横向 = 行间废边槽数。每个废边槽记 1 刀（沿其两条边界裁出废边）。
     """
-    per_gutter = 2 if bleed > 0 else 1
-    v = (cols // 2 - 1) * per_gutter
-    h = (rows - 1) * per_gutter
-    return v, h
+    return cols // 2, rows - 1
+
+
+def compute_mark_geometry(spec: JobSpec, side_cells: list[CellModel]) -> dict:
+    """由工单单元格 trim 位置计算标线几何（mm），工单与 PDF 共用，保证一致。
+
+    - fold_v：折页单元书脊中线（仅为折叠线，绝不作为裁切线）；
+    - cut_v：单元间纵向废边的两条边界（出血为 0 时合为一条）；
+    - ext_v：纵向外部裁切线——拼版区出血外框右缘（版面靠左/侧规边对齐，
+      左缘与纸边重合无需开刀），真正分隔印栏与废纸边；
+    - cut_h：行间横向废边的两条边界（出血为 0 时合为一条）；
+    - bbox：拼版区 trim 外框（四角裁切角线位置）。
+    """
+    cw = side_cells[0].w_mm
+    ch = side_cells[0].h_mm
+    lefts = {cell.col: cell.x_mm for cell in side_cells}   # 各列 trim 左缘
+    bottoms = {cell.row: cell.y_mm for cell in side_cells}  # 各行 trim 下缘
+    cols = sorted(lefts)
+
+    # 单元中线 = 奇数列（单元右格）的 trim 左缘
+    fold_v = sorted({lefts[c] for c in cols if c % 2 == 1})
+
+    # 单元间隔处的裁切线：左单元 trim 右缘 + 右单元 trim 左缘（出血为 0 时重合去重）
+    cut_v: list[float] = []
+    unit_cols = [c for c in cols if c % 2 == 0]
+    for lc, nc in zip(unit_cols, unit_cols[1:]):
+        cut_v.append(lefts[lc + 1] + cw)  # 左单元右缘
+        cut_v.append(lefts[nc])           # 右单元左缘
+    cut_v = sorted(set(round(x, 3) for x in cut_v))
+
+    # 纵向外部裁切线：拼版区出血外框右缘
+    ext_v = [round(max(lefts.values()) + cw + spec.bleed, 3)]
+
+    # 行间裁切线：按 y 由低到高取相邻两行的废边边界（下行 trim 上缘 + 上行 trim 下缘）
+    cut_h: list[float] = []
+    ys = sorted(bottoms.values())
+    for lower_y, upper_y in zip(ys, ys[1:]):
+        cut_h.append(round(lower_y + ch, 3))  # 下行 trim 上缘
+        cut_h.append(round(upper_y, 3))       # 上行 trim 下缘
+    cut_h = sorted(set(cut_h))
+
+    return {
+        "fold_v": fold_v,
+        "cut_v": cut_v,
+        "ext_v": ext_v,
+        "cut_h": cut_h,
+        "bbox": (min(lefts.values()), min(bottoms.values()),
+                 max(lefts.values()) + cw, max(bottoms.values()) + ch),
+    }
 
 
 def _unit_pages(sig_pages: int, base: int, u: int) -> tuple[int, int, int, int]:
@@ -141,31 +187,37 @@ def _cells(
 
 
 def _steps(spec: JobSpec, cols: int, rows: int, n_units: int,
-           signatures: int, units_per_sig: int) -> list[str]:
-    """裁切折叠顺序：先裁切分离单元（中线只是折叠线），再折叠成帖。"""
-    v, h = cut_line_counts(cols, rows, spec.bleed)
-    cut_parts = []
-    if v:
-        cut_parts.append(f"纵切 {v} 刀")
-    if h:
-        cut_parts.append(f"横切 {h} 刀")
-    cut_desc = "、".join(cut_parts) if cut_parts else "无需开刀"
+           signatures: int, units_per_sig: int, geo: dict) -> list[str]:
+    """裁切折叠顺序：先外部裁切分离纸边与单元，再沿书脊中线折叠。"""
+    v, h = cut_counts(cols, rows)
+    ext = "、".join(f"{x:g}" for x in geo["ext_v"])
+    cv = "、".join(f"{x:g}" for x in geo["cut_v"])
+    chn = "、".join(f"{y:g}" for y in geo["cut_h"])
+    fold = "、".join(f"{x:g}" for x in geo["fold_v"])
+    v_desc = f"沿外部裁切线 x={ext}mm 分离侧规对边纸边"
+    if cv:
+        v_desc += f"，再沿单元间废边边界 x={cv}mm 裁开"
+    h_desc = f"沿行间废边边界 y={chn}mm 裁开" if chn else "无行间废边"
     steps = [
-        f"裁切：先按四角裁切线裁齐纸边，再沿单元间裁切线{cut_desc}，"
+        f"裁切（先外部裁切、再分离单元，全程不经过书脊中线）："
+        f"① 纵切 {v} 刀——{v_desc}；② 横切 {h} 刀——{h_desc}。"
         f"分离出 {n_units} 个折页单元（每单元 2 页宽 × 1 页高，共 {n_units * 4} 页）。"
-        "注意：书脊中线仅为折叠线，任何裁切不得经过中线，切勿裁开折页单元",
+        "书脊中线仅为折叠线，任何裁切不得经过中线，切勿裁开折页单元",
     ]
     if spec.binding == BindingType.saddle:
         steps.append(
             f"套页：将全部 {units_per_sig} 个折页单元按编号 1→{units_per_sig} 顺序套叠"
             "（1 号在最外层），沿书脊中线对齐"
         )
-        steps.append("折叠：裁切完成后，沿每个单元的书脊中线对折，一次折合成册")
+        steps.append(
+            f"折叠：裁切全部完成后，沿每个单元的书脊中线（x={fold}mm）对折，一次折合成册"
+        )
         steps.append("装订：沿书脊骑马钉 2~3 钉，三面裁切成品")
     else:
         steps.append(
             f"成帖：每帖 {units_per_sig} 个折页单元按编号顺序叠放，"
-            f"裁切完成后沿书脊中线对折成帖（每帖 {spec.pages_per_signature} 页）"
+            f"裁切全部完成后沿书脊中线（x={fold}mm）对折成帖"
+            f"（每帖 {spec.pages_per_signature} 页）"
         )
         steps.append(
             f"配帖：共 {signatures} 帖，按帖码 1→{signatures} 顺序配帖"
@@ -200,7 +252,9 @@ def _build_plan(spec: JobSpec, total_pages: int, rotation: int,
 
     px0, py0, pw, ph = printable_area(spec)
     foot_w, foot_h = grid_footprint(cols, rows, cw, ch, spec.bleed)
-    ox = px0 + (pw - foot_w) / 2
+    # 横向靠侧规边（可印区左缘）对齐：左侧与纸边重合，右侧只需一条外部裁切线；
+    # 纵向在可印区内居中
+    ox = px0
     oy = py0 + (ph - foot_h) / 2
 
     sheets: list[SheetModel] = []
@@ -216,8 +270,9 @@ def _build_plan(spec: JobSpec, total_pages: int, rotation: int,
             back=SheetSide(cells=_cells(spec, back_g, cols, rows, cw, ch, ox, oy, rotation, True)),
         ))
 
-    v_cuts, h_cuts = cut_line_counts(cols, rows, spec.bleed)
+    v_cuts, h_cuts = cut_counts(cols, rows)
     units_per_sig = sheets_per_sig * n_units
+    geo = compute_mark_geometry(spec, sheets[0].front.cells)
     return PlanModel(
         id=f"rot{rotation}-{cols}x{rows}",
         binding=spec.binding, rotation=rotation, cols=cols, rows=rows,
@@ -228,7 +283,7 @@ def _build_plan(spec: JobSpec, total_pages: int, rotation: int,
         cuts_per_sheet=v_cuts + h_cuts,
         grain_parallel_to_spine=True,
         printable_width_mm=pw, printable_height_mm=ph,
-        steps=_steps(spec, cols, rows, n_units, signatures, units_per_sig),
+        steps=_steps(spec, cols, rows, n_units, signatures, units_per_sig, geo),
         sheets=sheets,
     )
 

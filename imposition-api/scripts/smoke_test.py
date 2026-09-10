@@ -127,6 +127,7 @@ check("不存在的方案返回 404", r.status_code == 404)
 
 print("== 5. 回归：裁切/折叠分离 + 出血计入可印区域 ==")
 from app.pdf_builder import compute_mark_geometry  # noqa: E402
+from app.schemas import CellModel, JobSpec  # noqa: E402
 
 r = post("/api/ticket", src, spec, {"rotation": 0, "cols": 2, "rows": 2})
 tk = r.json()
@@ -134,40 +135,48 @@ steps = tk["steps"]
 cut_idx = next(i for i, s in enumerate(steps) if s.startswith("裁切"))
 fold_idx = next(i for i, s in enumerate(steps) if s.startswith("折叠"))
 check("裁切步骤在折叠步骤之前", cut_idx < fold_idx, steps[0][:40])
-check("2x2 工单无纵切（中线非裁切线）", "纵切" not in steps[cut_idx], steps[cut_idx])
+check("工单含 纵切1刀", "纵切 1 刀" in steps[cut_idx], steps[cut_idx][:60])
+check("工单含 横切1刀", "横切 1 刀" in steps[cut_idx])
+check("工单表达先外部裁切", "先外部裁切" in steps[cut_idx])
 check("工单声明中线仅为折叠线", "中线仅为折叠线" in steps[cut_idx])
-# 2x2、出血3mm：单元间仅 1 条横向间隔，出血>0 每间隔 2 刀 → 共 2 刀
-check("2x2 裁切刀数=2（横间隔×2）", tk["plan"]["cuts_per_sheet"] == 2,
+# 2x2：纵切=单元列间槽0+外部1=1，横切=行间槽1 → 共 2 刀
+check("2x2 裁切刀数=2（纵1+横1）", tk["plan"]["cuts_per_sheet"] == 2,
       str(tk["plan"]["cuts_per_sheet"]))
+check("刀数=纵(单元列槽+1外部)+横(行槽)",
+      tk["plan"]["cuts_per_sheet"] == tk["plan"]["cols"] // 2 + tk["plan"]["rows"] - 1)
 
-# 工单与 PDF 标线一致：同一几何函数，裁切线数==工单刀数，折叠线数==单元数
-from app.schemas import CellModel  # noqa: E402
+# 工单与 PDF 标线一致：同一几何函数，坐标精确匹配
 cells = tk["sheets"][0]["front"]["cells"]
-geo = compute_mark_geometry([CellModel(**c) for c in cells])
-n_cuts = len(geo["cut_v"]) + len(geo["cut_h"])
-check("标线裁切数与工单刀数一致", n_cuts == tk["plan"]["cuts_per_sheet"],
-      f"{n_cuts} vs {tk['plan']['cuts_per_sheet']}")
-check("折叠线数=每行单元列数", len(geo["fold_v"]) == tk["plan"]["cols"] // 2)
-check("裁切线与折叠线无交集", not (set(geo["cut_v"]) & set(geo["fold_v"])))
-# 裁切线不得穿过任何折页单元内部
+geo = compute_mark_geometry(JobSpec(**tk["job"]), [CellModel(**c) for c in cells])
+check("横向裁切线=行间废边边界[227,233]", geo["cut_h"] == [227.0, 233.0], str(geo["cut_h"]))
+check("纵向外部裁切线 x=216", geo["ext_v"] == [216.0], str(geo["ext_v"]))
+check("无单元间纵向裁切线", geo["cut_v"] == [])
+check("折叠线=书脊中线 x=108", geo["fold_v"] == [108.0], str(geo["fold_v"]))
+all_cuts = set(geo["cut_v"]) | set(geo["ext_v"]) | set(geo["cut_h"])
+check("裁切线与折叠线无交集", not (set(geo["fold_v"]) & all_cuts))
+# 裁切线（含外部线）不得穿过任何折页单元内部
 units = {}
 for c in cells:
     units.setdefault((c["row"], c["col"] // 2), []).append(c["x_mm"])
 bad = []
 for (row, cp), xs in units.items():
     lo, hi = min(xs), max(xs) + cells[0]["w_mm"]
-    for x in geo["cut_v"]:
+    for x in geo["cut_v"] + geo["ext_v"]:
         if lo + 0.01 < x < hi - 0.01:
             bad.append((row, cp, x))
 check("裁切线不穿过折页单元", not bad, str(bad))
 
-# PDF 内容流：裁切虚线与折叠点划线两种线型都在
+# PDF 内容流：裁切虚线、折叠点划线、外部裁切实线（无线型设置）都在；图例文字在
 r = post("/api/pdf", src, spec, {"rotation": 0, "cols": 2, "rows": 2})
 check("2x2 pdf 200", r.status_code == 200)
 out = PdfReader(io.BytesIO(r.content))
 stream = out.pages[0].get_contents().get_data()
 check("PDF 含裁切虚线线型", b"[4 3] 0 d" in stream)
 check("PDF 含折叠点划线线型", b"[10 3] 0 d" in stream)
+# 外部裁切实线：x=216mm=612.283pt 的竖线（mo 起点在页面底部 y=0）
+check("PDF 含外部裁切实线坐标", b"612.28" in stream)
+text = out.pages[0].extract_text()
+check("PDF 图例表达先裁后折", "先外部裁切" in text and "中线禁裁" in text)
 
 # 越界：210×158 纸 + 底部咬口10 + 出血3 → 含出血单元 216×154 超出 210×148 可印区
 # （短边纹使纹向校验通过，确保拒绝原因就是尺寸/出血）
