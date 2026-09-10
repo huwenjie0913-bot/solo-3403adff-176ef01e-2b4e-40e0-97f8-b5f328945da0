@@ -21,6 +21,46 @@ def _pt(v_mm: float) -> float:
     return v_mm * MM
 
 
+def compute_mark_geometry(side_cells: list[CellModel]) -> dict:
+    """由工单单元格 trim 位置计算标线几何（mm），工单与 PDF 共用，保证一致。
+
+    - fold_v：折页单元书脊中线（仅为折叠线，绝不作为裁切线）；
+    - cut_v / cut_h：单元之间的裁切线（出血>0 时每个间隔两条，中间为废边）；
+    - bbox：拼版区 trim 外框（四角裁切角线位置）。
+    """
+    cw = side_cells[0].w_mm
+    ch = side_cells[0].h_mm
+    lefts = {cell.col: cell.x_mm for cell in side_cells}   # 各列 trim 左缘
+    bottoms = {cell.row: cell.y_mm for cell in side_cells}  # 各行 trim 下缘
+    cols = sorted(lefts)
+    rows = sorted(bottoms)
+
+    # 单元中线 = 奇数列（单元右格）的 trim 左缘
+    fold_v = sorted({lefts[c] for c in cols if c % 2 == 1})
+
+    # 单元间隔处的裁切线：左单元 trim 右缘 + 右单元 trim 左缘（出血为 0 时重合去重）
+    cut_v: list[float] = []
+    unit_cols = [c for c in cols if c % 2 == 0]
+    for lc, nc in zip(unit_cols, unit_cols[1:]):
+        cut_v.append(lefts[lc + 1] + cw)  # 左单元右缘
+        cut_v.append(lefts[nc])           # 右单元左缘
+    cut_v = sorted(set(round(x, 3) for x in cut_v))
+
+    cut_h: list[float] = []
+    for lower, upper in zip(rows, rows[1:]):
+        cut_h.append(bottoms[lower] + ch)  # 下行 trim 上缘
+        cut_h.append(bottoms[upper])       # 上行 trim 下缘
+    cut_h = sorted(set(round(y, 3) for y in cut_h))
+
+    return {
+        "fold_v": fold_v,
+        "cut_v": cut_v,
+        "cut_h": cut_h,
+        "bbox": (min(lefts.values()), min(bottoms.values()),
+                 max(lefts.values()) + cw, max(bottoms.values()) + ch),
+    }
+
+
 def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
                 side_cells: list[CellModel], side_name: str) -> bytes:
     """绘制一张纸某一面的标记层：裁切线、套准标记、帖码、咬口、折叠线。"""
@@ -49,11 +89,8 @@ def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
         c.rect(sw - g, 0, g, sh, stroke=0, fill=1)
 
     if side_cells:
-        xs = sorted({_pt(cell.x_mm) for cell in side_cells})
-        ys = sorted({_pt(cell.y_mm) for cell in side_cells})
-        cw, ch = _pt(side_cells[0].w_mm), _pt(side_cells[0].h_mm)
-        gx0, gy0 = xs[0], ys[0]
-        gx1, gy1 = xs[-1] + cw, ys[-1] + ch
+        geo = compute_mark_geometry(side_cells)
+        gx0, gy0, gx1, gy1 = (_pt(v) for v in geo["bbox"])
 
         # 外框四角裁切角线（trim corner ticks）
         tick, off = _pt(5), _pt(1.5)
@@ -63,22 +100,23 @@ def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
                 c.line(cx + sx * off, cy, cx + sx * (off + tick), cy)
                 c.line(cx, cy + sy * off, cx, cy + sy * (off + tick))
 
-        # 内部裁切线（虚线，贯通整个拼版区）
+        # 单元间裁切线（虚线，贯通整个拼版区；书脊中线绝不画裁切线）
         c.setDash([4, 3], 0)
-        for x in xs[1:]:
-            c.line(x, gy0, x, gy1)
-        for y in ys[1:]:
-            c.line(gx0, y, gx1, y)
+        for x in geo["cut_v"]:
+            xp = _pt(x)
+            c.line(xp, gy0, xp, gy1)
+        for y in geo["cut_h"]:
+            yp = _pt(y)
+            c.line(gx0, yp, gx1, yp)
         c.setDash()
 
-        # 折叠线：每个折页单元中线（点划线，伸出拼版区外 5mm）
+        # 折叠线：每个折页单元书脊中线（点划线，伸出拼版区外 5mm，仅折叠用）
         c.setDash([10, 3], 0)
         c.setLineWidth(0.7)
         ext = _pt(5)
-        for cell in side_cells:
-            if cell.col % 2 == 1:  # 单元右格 → 中线在其左缘
-                x = _pt(cell.x_mm)
-                c.line(x, gy0 - ext, x, gy1 + ext)
+        for x in geo["fold_v"]:
+            xp = _pt(x)
+            c.line(xp, gy0 - ext, xp, gy1 + ext)
         c.setDash()
         c.setLineWidth(0.4)
 

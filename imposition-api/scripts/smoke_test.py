@@ -125,6 +125,69 @@ check("指定 2x2 方案", r.status_code == 200 and r.json()["plan"]["cols"] == 
 r = post("/api/ticket", src, spec, {"rotation": 0, "cols": 8, "rows": 8})
 check("不存在的方案返回 404", r.status_code == 404)
 
+print("== 5. 回归：裁切/折叠分离 + 出血计入可印区域 ==")
+from app.pdf_builder import compute_mark_geometry  # noqa: E402
+
+r = post("/api/ticket", src, spec, {"rotation": 0, "cols": 2, "rows": 2})
+tk = r.json()
+steps = tk["steps"]
+cut_idx = next(i for i, s in enumerate(steps) if s.startswith("裁切"))
+fold_idx = next(i for i, s in enumerate(steps) if s.startswith("折叠"))
+check("裁切步骤在折叠步骤之前", cut_idx < fold_idx, steps[0][:40])
+check("2x2 工单无纵切（中线非裁切线）", "纵切" not in steps[cut_idx], steps[cut_idx])
+check("工单声明中线仅为折叠线", "中线仅为折叠线" in steps[cut_idx])
+# 2x2、出血3mm：单元间仅 1 条横向间隔，出血>0 每间隔 2 刀 → 共 2 刀
+check("2x2 裁切刀数=2（横间隔×2）", tk["plan"]["cuts_per_sheet"] == 2,
+      str(tk["plan"]["cuts_per_sheet"]))
+
+# 工单与 PDF 标线一致：同一几何函数，裁切线数==工单刀数，折叠线数==单元数
+from app.schemas import CellModel  # noqa: E402
+cells = tk["sheets"][0]["front"]["cells"]
+geo = compute_mark_geometry([CellModel(**c) for c in cells])
+n_cuts = len(geo["cut_v"]) + len(geo["cut_h"])
+check("标线裁切数与工单刀数一致", n_cuts == tk["plan"]["cuts_per_sheet"],
+      f"{n_cuts} vs {tk['plan']['cuts_per_sheet']}")
+check("折叠线数=每行单元列数", len(geo["fold_v"]) == tk["plan"]["cols"] // 2)
+check("裁切线与折叠线无交集", not (set(geo["cut_v"]) & set(geo["fold_v"])))
+# 裁切线不得穿过任何折页单元内部
+units = {}
+for c in cells:
+    units.setdefault((c["row"], c["col"] // 2), []).append(c["x_mm"])
+bad = []
+for (row, cp), xs in units.items():
+    lo, hi = min(xs), max(xs) + cells[0]["w_mm"]
+    for x in geo["cut_v"]:
+        if lo + 0.01 < x < hi - 0.01:
+            bad.append((row, cp, x))
+check("裁切线不穿过折页单元", not bad, str(bad))
+
+# PDF 内容流：裁切虚线与折叠点划线两种线型都在
+r = post("/api/pdf", src, spec, {"rotation": 0, "cols": 2, "rows": 2})
+check("2x2 pdf 200", r.status_code == 200)
+out = PdfReader(io.BytesIO(r.content))
+stream = out.pages[0].get_contents().get_data()
+check("PDF 含裁切虚线线型", b"[4 3] 0 d" in stream)
+check("PDF 含折叠点划线线型", b"[10 3] 0 d" in stream)
+
+# 越界：210×158 纸 + 底部咬口10 + 出血3 → 含出血单元 216×154 超出 210×148 可印区
+# （短边纹使纹向校验通过，确保拒绝原因就是尺寸/出血）
+over = {**SPEC_BASE, "binding": "saddle", "sheet_width": 210, "sheet_height": 158,
+        "grain": "short_edge"}
+r = post("/api/plans", src, over)
+body = r.json()
+check("越界方案被拒绝", len(body["plans"]) == 0 and len(body["rejections"]) > 0)
+reasons = json.dumps(body["rejections"], ensure_ascii=False)
+check("原因提及出血", "出血" in reasons)
+check("原因提及咬口", "咬口" in reasons)
+check("首条原因就是越界", "放不下一个折页单元" in body["rejections"][0]["reason"])
+print(f"  原因示例: {body['rejections'][0]['reason']}")
+
+# 临界可行：230×170 纸（可印 230×160 ≥ 216×154）应通过
+fit = {**over, "sheet_width": 230, "sheet_height": 170}
+r = post("/api/plans", src, fit)
+check("临界可行方案被接受", len(r.json()["plans"]) > 0)
+
+
 print()
 if failures:
     print(f"共 {len(failures)} 项失败: {failures}")

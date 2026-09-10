@@ -2,6 +2,12 @@
 
 坐标约定：原点为纸张左下角，x 向右，y 向上（与 PDF 一致），单位 mm。
 一个"折页单元"= 一张纸裁折后的最小单元 = 2 页宽 × 1 页高 = 4 页。
+
+版面布局规则：
+- 单元内两页在书脊中线处紧贴（中线只是折叠线，不是裁切线）；
+- 单元与单元之间、拼版区外缘均留出出血边距，保证每页的带出血矩形
+  完整落在扣除咬口后的可印区域内；
+- 裁切只发生在单元之间的出血间隔处，先裁切分离单元，再沿中线折叠。
 """
 from __future__ import annotations
 
@@ -42,6 +48,29 @@ def printable_area(spec: JobSpec) -> tuple[float, float, float, float]:
     if e == GripperEdge.left:
         return g, 0.0, sw - g, sh
     return 0.0, 0.0, sw - g, sh
+
+
+def grid_footprint(cols: int, rows: int, cw: float, ch: float, bleed: float) -> tuple[float, float]:
+    """拼版区含出血的总外廓（宽, 高）。
+
+    单元内两页紧贴；相邻单元之间留 2×出血（双方各留一边），
+    拼版区上下左右外缘各留 1×出血，确保所有页面的带出血矩形都在可印区域内。
+    """
+    b2 = 2 * bleed
+    w = cols * cw + (cols // 2 - 1) * b2 + b2
+    h = rows * ch + (rows - 1) * b2 + b2
+    return w, h
+
+
+def cut_line_counts(cols: int, rows: int, bleed: float) -> tuple[int, int]:
+    """每张纸的裁切刀数（纵, 横）。书脊中线是折叠线，不计入裁切。
+
+    出血 > 0 时单元间隔为 2×出血的废边，需两刀剔除；出血为 0 时合一刀。
+    """
+    per_gutter = 2 if bleed > 0 else 1
+    v = (cols // 2 - 1) * per_gutter
+    h = (rows - 1) * per_gutter
+    return v, h
 
 
 def _unit_pages(sig_pages: int, base: int, u: int) -> tuple[int, int, int, int]:
@@ -85,6 +114,15 @@ def _grid_pages(
     return front, back
 
 
+def _cell_xy(col: int, row: int, rows: int, cw: float, ch: float,
+             bleed: float, ox: float, oy: float) -> tuple[float, float]:
+    """单元格 trim 框左下角坐标：单元内两页紧贴，单元间留 2×出血废边。"""
+    cp, within = divmod(col, 2)
+    x = ox + bleed + cp * (2 * cw + 2 * bleed) + within * cw
+    y = oy + bleed + (rows - 1 - row) * (ch + 2 * bleed)
+    return x, y
+
+
 def _cells(
     spec: JobSpec, grid: dict, cols: int, rows: int,
     cw: float, ch: float, ox: float, oy: float, rotation: int, back_side: bool,
@@ -94,34 +132,40 @@ def _cells(
     if back_side and spec.flip == FlipMode.short_edge:
         rot = (rotation + 180) % 360
     for (row, col), page in sorted(grid.items()):
+        x, y = _cell_xy(col, row, rows, cw, ch, spec.bleed, ox, oy)
         cells.append(CellModel(
             row=row, col=col, page=page, rotation=rot,
-            x_mm=round(ox + col * cw, 3),
-            y_mm=round(oy + (rows - 1 - row) * ch, 3),
-            w_mm=cw, h_mm=ch,
+            x_mm=round(x, 3), y_mm=round(y, 3), w_mm=cw, h_mm=ch,
         ))
     return cells
 
 
 def _steps(spec: JobSpec, cols: int, rows: int, n_units: int,
            signatures: int, units_per_sig: int) -> list[str]:
-    steps = []
-    v, h = cols - 1, rows - 1
-    steps.append(
-        f"裁切：每张纸纵向切 {v} 刀、横向切 {h} 刀（先横后纵），"
-        f"得到 {n_units} 个折页单元（每单元 2 页宽 × 1 页高，共 {n_units * 4} 页）"
-    )
+    """裁切折叠顺序：先裁切分离单元（中线只是折叠线），再折叠成帖。"""
+    v, h = cut_line_counts(cols, rows, spec.bleed)
+    cut_parts = []
+    if v:
+        cut_parts.append(f"纵切 {v} 刀")
+    if h:
+        cut_parts.append(f"横切 {h} 刀")
+    cut_desc = "、".join(cut_parts) if cut_parts else "无需开刀"
+    steps = [
+        f"裁切：先按四角裁切线裁齐纸边，再沿单元间裁切线{cut_desc}，"
+        f"分离出 {n_units} 个折页单元（每单元 2 页宽 × 1 页高，共 {n_units * 4} 页）。"
+        "注意：书脊中线仅为折叠线，任何裁切不得经过中线，切勿裁开折页单元",
+    ]
     if spec.binding == BindingType.saddle:
         steps.append(
             f"套页：将全部 {units_per_sig} 个折页单元按编号 1→{units_per_sig} 顺序套叠"
             "（1 号在最外层），沿书脊中线对齐"
         )
-        steps.append("折叠：沿每个单元书脊中线对折，一次折合成册")
+        steps.append("折叠：裁切完成后，沿每个单元的书脊中线对折，一次折合成册")
         steps.append("装订：沿书脊骑马钉 2~3 钉，三面裁切成品")
     else:
         steps.append(
             f"成帖：每帖 {units_per_sig} 个折页单元按编号顺序叠放，"
-            f"沿书脊中线对折成帖（每帖 {spec.pages_per_signature} 页）"
+            f"裁切完成后沿书脊中线对折成帖（每帖 {spec.pages_per_signature} 页）"
         )
         steps.append(
             f"配帖：共 {signatures} 帖，按帖码 1→{signatures} 顺序配帖"
@@ -155,8 +199,9 @@ def _build_plan(spec: JobSpec, total_pages: int, rotation: int,
     blanks = list(range(total_pages + 1, capacity + 1))
 
     px0, py0, pw, ph = printable_area(spec)
-    ox = px0 + (pw - cols * cw) / 2
-    oy = py0 + (ph - rows * ch) / 2
+    foot_w, foot_h = grid_footprint(cols, rows, cw, ch, spec.bleed)
+    ox = px0 + (pw - foot_w) / 2
+    oy = py0 + (ph - foot_h) / 2
 
     sheets: list[SheetModel] = []
     for s in range(sheets_total):
@@ -171,6 +216,7 @@ def _build_plan(spec: JobSpec, total_pages: int, rotation: int,
             back=SheetSide(cells=_cells(spec, back_g, cols, rows, cw, ch, ox, oy, rotation, True)),
         ))
 
+    v_cuts, h_cuts = cut_line_counts(cols, rows, spec.bleed)
     units_per_sig = sheets_per_sig * n_units
     return PlanModel(
         id=f"rot{rotation}-{cols}x{rows}",
@@ -179,7 +225,7 @@ def _build_plan(spec: JobSpec, total_pages: int, rotation: int,
         sheets_total=sheets_total, signatures=signatures,
         sheets_per_signature=sheets_per_sig,
         capacity_pages=capacity, blank_pages=len(blanks), blanks=blanks,
-        cuts_per_sheet=(cols - 1) + (rows - 1),
+        cuts_per_sheet=v_cuts + h_cuts,
         grain_parallel_to_spine=True,
         printable_width_mm=pw, printable_height_mm=ph,
         steps=_steps(spec, cols, rows, n_units, signatures, units_per_sig),
@@ -192,6 +238,7 @@ def enumerate_plans(spec: JobSpec, total_pages: int) -> tuple[list[PlanModel], l
     plans: list[PlanModel] = []
     rejections: list[RejectionModel] = []
     fw, fh = spec.finished_width, spec.finished_height
+    b = spec.bleed
     _, _, pw, ph = printable_area(spec)
     axis = grain_axis(spec)
 
@@ -208,19 +255,22 @@ def enumerate_plans(spec: JobSpec, total_pages: int) -> tuple[list[PlanModel], l
                        f"页面{orient}后纹向不平行书脊",
             ))
             continue
-        max_cols = int(pw // cw)
-        max_rows = int(ph // ch)
-        if max_cols < 2 or max_rows < 1:
+        # 可印区域校验计入出血：带出血矩形须完整落在扣除咬口的区域内
+        unit_w, unit_h = grid_footprint(2, 1, cw, ch, b)
+        if unit_w > pw or unit_h > ph:
             rejections.append(RejectionModel(
                 layout=f"{orient}",
                 reason=f"可印区域 {pw:.1f}×{ph:.1f}mm 放不下一个折页单元"
-                       f"（需 {2 * cw:.1f}×{ch:.1f}mm，已扣除咬口 {spec.gripper}mm）",
+                       f"（含出血需 {unit_w:.1f}×{unit_h:.1f}mm = "
+                       f"成品 {2 * cw:.1f}×{ch:.1f}mm 加四周出血 {b:g}mm；"
+                       f"已扣除咬口 {spec.gripper:g}mm）",
             ))
             continue
         cols = 2
-        while cols <= max_cols and cols <= MAX_PAGES_PER_SIDE:
+        while cols <= MAX_PAGES_PER_SIDE and grid_footprint(cols, 1, cw, ch, b)[0] <= pw:
             rows = 1
-            while rows <= max_rows and cols * rows <= MAX_PAGES_PER_SIDE:
+            while (cols * rows <= MAX_PAGES_PER_SIDE
+                   and grid_footprint(cols, rows, cw, ch, b)[1] <= ph):
                 plan = _build_plan(spec, total_pages, rotation, cols, rows)
                 if plan is None:
                     rejections.append(RejectionModel(
