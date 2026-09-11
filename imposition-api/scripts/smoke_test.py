@@ -340,6 +340,60 @@ check("混合帖模式兼容开数选择器", r.status_code == 200
 r = post("/api/ticket", src50, spec_mix, {"plan_id": "no-such-plan"})
 check("不存在的候选 ID 返回 404", r.status_code == 404)
 
+print("== 9. 混合帖广候选集：组合器精确枚举不静默截断 ==")
+from app.engine import _ComboSpaceTooLarge, _mixed_combos  # noqa: E402
+import app.engine as eng  # noqa: E402
+
+# 复现：400 页 + 4~200 全部 4 倍数帖型，旧实现漏掉排序更优的 (100,100,100,100)
+wide_sizes = list(range(4, 201, 4))
+combos = _mixed_combos(400, wide_sizes, 50, None, 10)
+check("广候选集含 (100,100,100,100)", (100, 100, 100, 100) in combos)
+check("最优组合为 (200,200)", combos[0] == (200, 200))
+check("(200,100,100) 排不进前 10", (200, 100, 100) not in combos)
+check("组合严格按 容量→帖型→页数差→帖数 排序",
+      combos == sorted(combos, key=lambda c: (sum(c), len(set(c)), max(c) - min(c), len(c))))
+
+# t≥3 精确补满：t1+t2 不足 50 个时由预算内 DFS 精确补足
+combos50 = _mixed_combos(200, [16, 12, 8], 50, None, 50)
+check("t≥3 精确补满 50 个候选且有序", len(combos50) == 50
+      and combos50 == sorted(combos50, key=lambda c: (sum(c), len(set(c)), max(c) - min(c), len(c))))
+
+# 超预算必须显式报错，不得静默截断返回不完整结果
+old_budget = eng._COMBO_DFS_BUDGET
+eng._COMBO_DFS_BUDGET = 10
+try:
+    _mixed_combos(200, [16, 12, 8], 50, None, 50)
+    raised = False
+except _ComboSpaceTooLarge:
+    raised = True
+finally:
+    eng._COMBO_DFS_BUDGET = old_budget
+check("超预算显式报错而非静默截断", raised)
+
+# API 级回归：400 页广候选集，最优候选与排序完整性
+src400 = make_sample(400, out="/tmp/sample400.pdf")
+wide = {**SPEC_BASE, "binding": "perfect",
+        "allowed_signature_pages": wide_sizes, "max_layouts": 8}
+r = post("/api/plans", src400, wide)
+check("广候选集 plans 200", r.status_code == 200, r.text[:200])
+body = r.json()
+ids = [p["id"] for p in body["plans"]]
+check("最优候选 (200,200)", ids[0] == "rot0-2x2-mix200x2", ids[0])
+check("全部候选零空白（容量恰为 400）", all(p["blank_pages"] == 0 for p in body["plans"]))
+check("候选严格按排序键有序", body["plans"] == sorted(body["plans"], key=lambda p: (
+    p["sheets_total"], p["blank_pages"], p["signature_types"], p["signature_spread"],
+    p["signatures"], p["cuts_per_sheet"], -p["pages_per_side"])))
+
+# 仅 2x1 开数可行（单张容量 4 页）：(100,100,100,100) 必须进入候选
+narrow = {**SPEC_BASE, "binding": "perfect", "grain": "short_edge",
+          "sheet_width": 230, "sheet_height": 170,
+          "allowed_signature_pages": wide_sizes, "max_layouts": 8}
+r = post("/api/plans", src400, narrow)
+body = r.json()
+ids = [p["id"] for p in body["plans"]]
+check("(100x4) 进入候选且仅次于 (200x2)",
+      ids[0] == "rot0-2x1-mix200x2" and ids[1] == "rot0-2x1-mix100x4", str(ids[:3]))
+
 
 print()
 if failures:

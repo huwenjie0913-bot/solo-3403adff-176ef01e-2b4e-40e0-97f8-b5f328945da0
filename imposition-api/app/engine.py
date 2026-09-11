@@ -30,7 +30,13 @@ from .schemas import (
 
 MAX_PAGES_PER_SIDE = 64  # 枚举上限，避免生成无意义的超小开数
 DEFAULT_MAX_SIGNATURES = 50  # 混合帖默认最大帖数
-_COMBO_NODE_BUDGET = 100_000  # 配帖组合枚举的节点预算（防止极端输入下组合爆炸）
+# 三种及以上帖型组合的 DFS 节点预算：仅在单/双帖型不足以填满候选数时启用；
+# 超预算必须显式报错（作为该开数的否决原因），绝不把未完整搜索的结果当作候选返回
+_COMBO_DFS_BUDGET = 2_000_000
+
+
+class _ComboSpaceTooLarge(Exception):
+    """配帖组合空间超过搜索预算，无法保证候选完整（不得静默截断返回）。"""
 
 
 def grain_axis(spec: JobSpec) -> str:
@@ -243,37 +249,97 @@ def _steps(spec: JobSpec, cols: int, rows: int, n_units: int,
     return steps
 
 
+def _combos_at_capacity(capacity: int, blanks: int, sizes: list[int],
+                        max_sigs: int, need: int,
+                        counter: list[int]) -> list[tuple[int, ...]]:
+    """容量恰为 capacity 的配帖组合，按 帖型数量→各帖页数差→帖数 排序，至多 need 个。
+
+    仅使用页数 > blanks 的帖型（保证空白全部落在末帖）。
+    单一/双帖型直接精确枚举（多项式复杂度）；三种及以上帖型在共享节点预算内 DFS，
+    超预算抛 _ComboSpaceTooLarge，绝不静默截断。
+    """
+    avail = [s for s in sizes if s > blanks]
+    if not avail:
+        return []
+
+    # 单一帖型：capacity = s × k
+    t1: list[tuple[int, ...]] = []
+    for s in avail:
+        if capacity % s == 0:
+            k = capacity // s
+            if 1 <= k <= max_sigs:
+                t1.append((s,) * k)
+
+    # 双帖型：a1·s1 + a2·s2 = capacity（a1,a2 ≥ 1，总数 ≤ max_sigs）
+    t2: list[tuple[int, ...]] = []
+    if len(t1) < need:
+        for i, s1 in enumerate(avail):
+            a1_max = min((capacity - avail[-1]) // s1, max_sigs - 1)
+            for a1 in range(1, a1_max + 1):
+                rem = capacity - a1 * s1
+                for s2 in avail[i + 1:]:
+                    if rem % s2 == 0:
+                        a2 = rem // s2
+                        if 1 <= a2 <= max_sigs - a1:
+                            t2.append((s1,) * a1 + (s2,) * a2)
+
+    combos = t1 + t2
+    if len(combos) < need and len(avail) >= 3:
+        # 三种及以上帖型：预算内 DFS（非增序列，恰好凑满容量）
+        extra: list[tuple[int, ...]] = []
+
+        def rec(total: int, start: int, depth: int, prefix: list[int]) -> None:
+            if counter[0] >= _COMBO_DFS_BUDGET:
+                raise _ComboSpaceTooLarge
+            counter[0] += 1
+            if total == capacity:
+                if len(set(prefix)) >= 3:
+                    extra.append(tuple(prefix))
+                return
+            if depth >= max_sigs:
+                return
+            if total + avail[-1] > capacity:
+                return  # 最小帖也放不下
+            if total + (max_sigs - depth) * avail[start] < capacity:
+                return  # 剩余帖数填不满容量
+            for i in range(start, len(avail)):
+                s = avail[i]
+                if total + s > capacity:
+                    continue  # 更小的帖仍可能可行
+                rec(total + s, i, depth + 1, prefix + [s])
+
+        rec(0, 0, 0, [])
+        combos += extra
+
+    combos.sort(key=lambda cb: (len(set(cb)), max(cb) - min(cb), len(cb)))
+    return combos[:need]
+
+
 def _mixed_combos(total_pages: int, sizes: list[int], max_sigs: int,
-                  max_blanks: int | None) -> list[tuple[int, ...]]:
-    """枚举可行的混合帖组合，返回帖页数降序元组列表（大帖在前、末帖最小）。
+                  max_blanks: int | None, limit: int) -> list[tuple[int, ...]]:
+    """精确枚举排序最优的至多 limit 个混合帖组合（帖页数降序元组，大帖在前、末帖最小）。
+
+    按 容量（=总用纸/空白页）→帖型数量→各帖页数差→帖数 的顺序返回：
+    容量升序遍历，每个容量内先精确枚举单一/双帖型，三种及以上帖型在节点预算内 DFS；
+    超预算抛 _ComboSpaceTooLarge——宁可显式失败，也不把未完整搜索的结果当作候选返回。
 
     约束：容量 ≥ 实际页数；帖数 ≤ max_sigs；空白页 = 容量 - 实际页数 ≤ max_blanks（若设置）；
     空白全部落在末帖——空白数 < 最小帖页数（末帖至少 1 个真实页，前帖不含空白）。
     """
     sizes = sorted(set(sizes), reverse=True)
     blank_hi = sizes[0] - 1 if max_blanks is None else min(max_blanks, sizes[0] - 1)
-    hi = total_pages + blank_hi  # 容量上界（末帖至少 1 个真实页，空白必小于最大帖）
-    combos: list[tuple[int, ...]] = []
-    nodes = 0
-
-    def rec(prefix: list[int], total: int, start: int) -> None:
-        nonlocal nodes
-        if nodes >= _COMBO_NODE_BUDGET:
-            return
-        nodes += 1
-        if total >= total_pages:
-            if total - total_pages < prefix[-1]:
-                combos.append(tuple(prefix))
-            return  # 再加帖只会增大空白且最小帖不增，必然违反末帖约束
-        if len(prefix) >= max_sigs:
-            return
-        for i in range(start, len(sizes)):
-            if total + sizes[i] > hi:
-                continue  # 更小的帖仍可能不超上界
-            rec(prefix + [sizes[i]], total + sizes[i], i)
-
-    rec([], 0, 0)
-    return combos
+    # 容量必为全部帖页数 gcd 的倍数，按 gcd 步进跳过系统性不可达的容量
+    g = sizes[0]
+    for s in sizes[1:]:
+        g = math.gcd(g, s)
+    results: list[tuple[int, ...]] = []
+    counter = [0]  # 全部容量共享的 DFS 节点计数
+    capacity = -(-total_pages // g) * g  # 向上取整到 g 的倍数
+    while capacity <= total_pages + blank_hi and len(results) < limit:
+        results += _combos_at_capacity(capacity, capacity - total_pages,
+                                       sizes, max_sigs, limit - len(results), counter)
+        capacity += g
+    return results
 
 
 def _min_blanks(total_pages: int, sizes: list[int], max_sigs: int) -> int | None:
@@ -479,19 +545,28 @@ def enumerate_plans(spec: JobSpec, total_pages: int) -> tuple[list[PlanModel], l
                         ))
                     else:
                         max_sigs = spec.max_signatures or DEFAULT_MAX_SIGNATURES
-                        combos = _mixed_combos(total_pages, sizes, max_sigs,
-                                               spec.max_blank_pages)
-                        if not combos:
+                        try:
+                            # 已按方案排序键精确取前 max_layouts 个候选
+                            combos = _mixed_combos(total_pages, sizes, max_sigs,
+                                                   spec.max_blank_pages,
+                                                   spec.max_layouts)
+                        except _ComboSpaceTooLarge:
+                            combos = None
+                        if combos is None:
+                            rejections.append(RejectionModel(
+                                layout=layout,
+                                reason="配帖组合空间过大，无法保证候选完整（不返回"
+                                       "未完整搜索的结果）：请缩小 allowed_signature_pages "
+                                       "范围、减少 max_layouts 或收紧 max_blank_pages",
+                            ))
+                        elif not combos:
                             rejections.append(RejectionModel(
                                 layout=layout,
                                 reason=_mixed_conflict_reason(
                                     total_pages, sizes, max_sigs, spec.max_blank_pages),
                             ))
                         else:
-                            # 与本方案排序同键预排序，每个开数只保留前 max_layouts 个候选
-                            combos.sort(key=lambda c: (sum(c), len(set(c)),
-                                                       max(c) - min(c), len(c)))
-                            for combo in combos[: spec.max_layouts]:
+                            for combo in combos:
                                 plans.append(_build_plan(spec, total_pages, rotation,
                                                          cols, rows, list(combo)))
                 else:

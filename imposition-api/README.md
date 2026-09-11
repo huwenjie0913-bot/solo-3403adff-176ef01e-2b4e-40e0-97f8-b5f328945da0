@@ -21,15 +21,16 @@ python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/health` | 健康检查 |
-| POST | `/api/plans` | 枚举可行开数/横竖放置方案（含无解原因），按纸张用量→空白页→裁切刀数排序 |
-| POST | `/api/ticket` | 生成 JSON 工单（默认最优方案，可用选择器指定开数） |
+| POST | `/api/plans` | 枚举可行开数/横竖放置方案（含无解原因），按总用纸→空白页→帖型数量→各帖页数差排序 |
+| POST | `/api/ticket` | 生成 JSON 工单（默认最优方案，可用 plan_id 或开数选择器指定候选） |
 | POST | `/api/pdf` | 输出拼版 PDF（裁切线、套准标记、帖码、咬口标注） |
 
 三个 POST 接口均为 `multipart/form-data`：
 
 - `file`：源 PDF（页面尺寸须等于成品尺寸，或成品尺寸+四边出血，容差 1.5mm）
 - `spec`：JobSpec JSON 字符串
-- `rotation` / `cols` / `rows`（可选，仅 ticket/pdf）：指定某个候选方案
+- `plan_id`（可选，仅 ticket/pdf）：按候选方案 ID 指定方案（优先于开数选择器）
+- `rotation` / `cols` / `rows`（可选，仅 ticket/pdf）：指定某个候选开数方案
 
 ### JobSpec 参数（单位 mm）
 
@@ -45,10 +46,35 @@ python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
   "gripper_edge": "bottom",     // 咬口所在纸边 top/bottom/left/right
   "flip": "long_edge",          // 双面翻转：long_edge 长边 / short_edge 短边
   "binding": "saddle",          // 装订：saddle 骑马订 / perfect 胶装
-  "pages_per_signature": 16,    // 每帖页数（仅胶装，须为 4 的倍数）
+  "pages_per_signature": 16,    // 每帖页数（仅胶装固定帖模式，须为 4 的倍数）
+  "allowed_signature_pages": null,  // 可选：允许的每帖页数候选列表（仅胶装，均须 4 的倍数）；
+                                    // 设置后启用混合帖规划并忽略 pages_per_signature
+  "max_signatures": null,       // 可选：最大帖数（仅混合帖，默认 50）
+  "max_blank_pages": null,      // 可选：空白页上限（仅混合帖，默认不限）
   "max_layouts": 8
 }
 ```
+
+### 胶装混合帖规划
+
+设置 `allowed_signature_pages` 后（仅胶装有效），按实际页数与候选开数组合配帖方案：
+
+- **约束**：各帖页数为 4 的倍数，且能被当前开数的单张纸容量（每面折页单元数 × 4 页）整除；
+  帖数不超过 `max_signatures`，空白页不超过 `max_blank_pages`；
+  空白页全部落在末帖（末帖至少 1 个真实页，前帖不含空白）。
+- **排序**：总用纸 → 空白页 → 帖型数量 → 各帖页数差。候选按容量升序精确枚举
+  （单一/双帖型直接求解，三种及以上帖型在节点预算内搜索），每个开数只保留前
+  `max_layouts` 个候选；组合空间超预算时该开数被显式否决并说明，
+  绝不把未完整搜索的结果当作候选返回。
+- **候选结果**：方案 ID 形如 `rot0-2x2-mix16x3+8`（开数 + 配帖构成）；
+  `signature_plan` 给出逐帖页码范围、容量、用纸数、空白页位置和帖码；
+  `signature_types`/`signature_spread` 为帖型数量与各帖页数差。
+- **工单/PDF**：`/api/ticket`、`/api/pdf` 可用 `plan_id` 指定混合帖候选，
+  按各帖容量生成页码网格；PDF 阶梯帖码、工单配帖顺序与候选结果均按帖序号 1→N 一致。
+- **无解时**：`rejections` 指出冲突的约束——帖数上限不足（`max_signatures`）、
+  空白页超限（`max_blank_pages`，附最小可实现空白页数）或
+  帖页数不被单张容量整除（`allowed_signature_pages`）。
+- 未设置 `allowed_signature_pages` 时保持固定帖行为；骑马订忽略上述三个参数。
 
 ### curl 示例
 
@@ -70,6 +96,21 @@ curl -s -F "file=@/tmp/src.pdf" -F "spec=$SPEC" -F "rotation=0" -F "cols=2" -F "
 # 拼版 PDF
 curl -s -F "file=@/tmp/src.pdf" -F "spec=$SPEC" \
   http://127.0.0.1:8000/api/pdf -o imposed.pdf
+
+# 胶装混合帖：50 页，允许 16/8 页帖
+python3 scripts/make_sample.py 50 105 148 /tmp/src50.pdf
+SPEC_MIX='{"finished_width":105,"finished_height":148,"sheet_width":320,"sheet_height":450,
+"grain":"long_edge","bleed":3,"gripper":10,"gripper_edge":"bottom","flip":"long_edge",
+"binding":"perfect","allowed_signature_pages":[16,8],"max_signatures":12,"max_blank_pages":8}'
+
+# 枚举混合帖候选（signature_plan 含逐帖页码范围/用纸/空白页/帖码）
+curl -s -F "file=@/tmp/src50.pdf" -F "spec=$SPEC_MIX" http://127.0.0.1:8000/api/plans
+
+# 按候选 ID 出工单 / 拼版 PDF
+curl -s -F "file=@/tmp/src50.pdf" -F "spec=$SPEC_MIX" -F "plan_id=rot0-2x2-mix16x3+8" \
+  http://127.0.0.1:8000/api/ticket
+curl -s -F "file=@/tmp/src50.pdf" -F "spec=$SPEC_MIX" -F "plan_id=rot0-2x2-mix16x3+8" \
+  http://127.0.0.1:8000/api/pdf -o imposed_mix.pdf
 ```
 
 ## 校验与无解原因
