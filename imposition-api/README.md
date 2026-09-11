@@ -22,15 +22,52 @@ python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 |---|---|---|
 | GET | `/api/health` | 健康检查 |
 | POST | `/api/plans` | 枚举可行开数/横竖放置方案（含无解原因），按总用纸→空白页→帖型数量→各帖页数差排序 |
-| POST | `/api/ticket` | 生成 JSON 工单（默认最优方案，可用 plan_id 或开数选择器指定候选） |
-| POST | `/api/pdf` | 输出拼版 PDF（裁切线、套准标记、帖码、咬口标注） |
+| POST | `/api/creep` | 骑马订爬移补偿与装订区校核：逐张（由外到内）/正反面/逐页返回原坐标、补偿后坐标、页码与逐项诊断 |
+| POST | `/api/ticket` | 生成 JSON 工单（默认最优方案，可用 plan_id 或开数选择器指定候选；提供爬移参数时追加 creep 段） |
+| POST | `/api/pdf` | 输出拼版 PDF（裁切线、套准标记、帖码、咬口标注；启用爬移时按补偿坐标置入并标书口/装订区/偏移量） |
 
-三个 POST 接口均为 `multipart/form-data`：
+三个（`/api/creep` 为四个）POST 接口均为 `multipart/form-data`：
 
 - `file`：源 PDF（页面尺寸须等于成品尺寸，或成品尺寸+四边出血，容差 1.5mm）
 - `spec`：JobSpec JSON 字符串
-- `plan_id`（可选，仅 ticket/pdf）：按候选方案 ID 指定方案（优先于开数选择器）
-- `rotation` / `cols` / `rows`（可选，仅 ticket/pdf）：指定某个候选开数方案
+- `plan_id`（可选，仅 creep/ticket/pdf）：按候选方案 ID 指定方案（优先于开数选择器）
+- `rotation` / `cols` / `rows`（可选，仅 creep/ticket/pdf）：指定某个候选开数方案
+
+### 骑马订爬移补偿（creep）
+
+骑马订全册纸张由外到内 1→N 套叠，内层纸沿书脊绕行更远，三面切书后内层页书口
+白边偏窄（爬移/creep）。`/api/creep` 按套帖顺序计算沿书脊法向（拼版面内水平方向，
+指向各折页单元书脊中线）的补偿量，`/api/ticket` 与 `/api/pdf` 使用**同一组补偿参数**：
+
+| 参数 | 单位 | 必填 | 说明 |
+|---|---|---|---|
+| `paper_thickness` | mm | `/api/creep` 必填；ticket/pdf 不提供即关闭补偿 | 单张纸厚度 |
+| `compression_factor` | — | 可选，默认 1.0 | 压缩系数（套叠压紧折算），须 >0 |
+| `binding_width` | mm | 必填 | 装订区宽度（以书脊中线为中心的骑订区总宽） |
+| `max_offset` | mm | 必填 | 最大允许补偿偏移，超过即诊断为补偿超限 |
+
+- **补偿模型**：步距 `step = paper_thickness × compression_factor`；
+  最外层纸（第 1 张）补偿 0，每向内一张多补偿一个步距，
+  第 i 张补偿量 = `step × (i-1)`。单元左页向 +x、右页向 -x（均指向书脊中线），
+  书脊中线本身不移动；`step_mm`、`formula` 在响应中给出。
+- **返回内容**：逐张（`nesting` 套帖层位、`creep_mm`）、正反面、逐页的
+  `original`（补偿前 trim 框左下角）、`compensated`（补偿后）、`shift_mm`、
+  页码、所靠书脊中线 `spine_x_mm` 与逐页诊断码；另有 `binding_zone`
+  （逐折页单元装订区中心/左右界）、书口方向说明与统计 `error_count`/`warning_count`。
+- **逐项诊断**（诊断不阻断，HTTP 仍返回 200）：
+  - `offset_exceeded`：某张纸补偿量超过 `max_offset`（逐张+逐页）；
+  - `out_of_printable`：补偿后页面（带出血矩形）越出扣除咬口的可印区域或纸张；
+  - `register_mismatch`：同一张纸正反面背对背页翻转镜像后不重合（正反面套准错位）；
+  - `binding_out_of_bounds`：装订区标记越界（出纸、入咬口、伸入相邻单元、
+    伸出折页线外）。
+- `/api/ticket` 工单的 `creep` 段逐张记录补偿与诊断；工单 `sheets` 中坐标仍为
+  补偿前原候选坐标。
+- `/api/pdf` 校样按补偿后坐标置入页面，额外标注**书口方向**（橙箭头）、
+  **装订区边界**（蓝色点线）和**逐张偏移量**，页眉注明补偿参数。
+- **预览与导出不修改原候选**：`/api/plans` 的候选坐标始终不变。
+- **未提供 `paper_thickness` 时保持现有拼版结果**（PDF 字节级一致，工单 `creep=null`）；
+  **胶装（perfect）按原逻辑处理**，提供爬移参数时显式忽略；`/api/creep` 仅接受骑马订。
+
 
 ### JobSpec 参数（单位 mm）
 
@@ -97,6 +134,22 @@ curl -s -F "file=@/tmp/src.pdf" -F "spec=$SPEC" -F "rotation=0" -F "cols=2" -F "
 curl -s -F "file=@/tmp/src.pdf" -F "spec=$SPEC" \
   http://127.0.0.1:8000/api/pdf -o imposed.pdf
 
+# 骑马订爬移补偿与装订区校核（纸厚 0.1mm、压缩系数 0.8、装订区 6mm、允许偏移 0.5mm）
+curl -s -F "file=@/tmp/src.pdf" -F "spec=$SPEC" \
+  -F "paper_thickness=0.1" -F "compression_factor=0.8" \
+  -F "binding_width=6" -F "max_offset=0.5" \
+  http://127.0.0.1:8000/api/creep
+
+# 同一组参数出工单（含 creep 段）与带爬移校样标注的 PDF
+curl -s -F "file=@/tmp/src.pdf" -F "spec=$SPEC" \
+  -F "paper_thickness=0.1" -F "compression_factor=0.8" \
+  -F "binding_width=6" -F "max_offset=0.5" \
+  http://127.0.0.1:8000/api/ticket
+curl -s -F "file=@/tmp/src.pdf" -F "spec=$SPEC" \
+  -F "paper_thickness=0.1" -F "compression_factor=0.8" \
+  -F "binding_width=6" -F "max_offset=0.5" \
+  http://127.0.0.1:8000/api/pdf -o imposed_creep.pdf
+
 # 胶装混合帖：50 页，允许 16/8 页帖
 python3 scripts/make_sample.py 50 105 148 /tmp/src50.pdf
 SPEC_MIX='{"finished_width":105,"finished_height":148,"sheet_width":320,"sheet_height":450,
@@ -132,6 +185,9 @@ curl -s -F "file=@/tmp/src50.pdf" -F "spec=$SPEC_MIX" -F "plan_id=rot0-2x2-mix16
 - 每页的带出血矩形（成品 + 四周出血）必须完整落在扣除咬口后的可印区域内，
   否则该方向/开数被否决并说明原因。
 - 骑马订：全册按单元由外向内套页（第 1 张正面为 [末页, 第1页, …]）。
+- 骑马订爬移补偿：提供 paper_thickness 等参数时（`/api/creep` 或 ticket/pdf），
+  按纸张由外到内套帖顺序逐张递增法向补偿（最外层 0，详见上文），并校核
+  补偿超限/越出可印区域/正反面套准错位/装订区标记越界；未提供纸张厚度时不补偿。
 - 胶装：每帖内部同样按由外向内折手，帖间按帖码配帖；书脊侧绘制阶梯帖码黑块。
 - 背面按双面翻转方式镜像：长边翻转左右镜像；短边翻转上下镜像且背面内容旋转 180°。
 - 排序：纸张用量 → 空白页数 → 裁切刀数 → 每面页数（大开数优先）。
@@ -139,17 +195,18 @@ curl -s -F "file=@/tmp/src50.pdf" -F "spec=$SPEC_MIX" -F "plan_id=rot0-2x2-mix16
 ## 测试
 
 ```bash
-python3 scripts/smoke_test.py   # 端到端冒烟测试（30+ 项断言，无需启动服务）
+python3 scripts/smoke_test.py   # 端到端冒烟测试（160+ 项断言，无需启动服务）
 ```
 
 ## 目录结构
 
 ```
 app/
-  main.py         FastAPI 入口与接口
-  schemas.py      Pydantic 请求/响应模型
-  engine.py       开数枚举、页码排布、校验与排序
-  pdf_builder.py  ReportLab 标记层 + pypdf 页面置入
+  main.py         FastAPI 入口与接口（/api/plans|creep|ticket|pdf）
+  schemas.py      Pydantic 请求/响应模型（含 CreepParams/CreepResponse）
+  engine.py       开数枚举、页码排布、校验与排序、标线几何
+  creep.py        骑马订爬移补偿与装订区校核（逐项诊断）
+  pdf_builder.py  ReportLab 标记层 + pypdf 页面置入（爬移校样标注）
 scripts/
   make_sample.py  生成测试用源 PDF
   smoke_test.py   冒烟测试

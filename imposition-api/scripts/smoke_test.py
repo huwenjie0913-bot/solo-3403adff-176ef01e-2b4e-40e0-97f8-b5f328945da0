@@ -394,9 +394,173 @@ ids = [p["id"] for p in body["plans"]]
 check("(100x4) 进入候选且仅次于 (200x2)",
       ids[0] == "rot0-2x1-mix200x2" and ids[1] == "rot0-2x1-mix100x4", str(ids[:3]))
 
+print("== 10. 骑马订爬移补偿 /api/creep ==")
+CREEP = {"paper_thickness": 0.1, "compression_factor": 0.8,
+         "binding_width": 6, "max_offset": 0.5}
+r = post("/api/creep", src, spec, CREEP)
+check("creep 200", r.status_code == 200, r.text[:300])
+cr = r.json()
+check("方案=最优骑马订候选", cr["plan_id"] == best["id"])
+check("步距=厚度×系数 0.08", cr["step_mm"] == 0.08, str(cr["step_mm"]))
+check("用纸张数一致", cr["sheets_total"] == best["sheets_total"])
+check("套帖层位 1→N", [s["nesting"] for s in cr["sheets"]] == [1, 2, 3, 4])
+check("逐张补偿 0/0.08/0.16/0.24",
+      [s["creep_mm"] for s in cr["sheets"]] == [0.0, 0.08, 0.16, 0.24],
+      str([s["creep_mm"] for s in cr["sheets"]]))
+s1, s4 = cr["sheets"][0], cr["sheets"][3]
+left_p = [p for p in s1["pages"] if p["side"] == "F" and p["col"] == 0][0]
+right_p = [p for p in s4["pages"] if p["side"] == "F" and p["col"] == 1][0]
+left4 = [p for p in s4["pages"] if p["side"] == "F" and p["col"] == 0][0]
+check("左页向 +x 补偿", left4["compensated"][0] == round(left4["original"][0] + 0.24, 3)
+      and left4["shift_mm"] == 0.24, str(left4["compensated"]))
+check("右页向 -x 补偿", right_p["compensated"][0] == round(right_p["original"][0] - 0.24, 3)
+      and right_p["shift_mm"] == -0.24, str(right_p["compensated"]))
+check("y 坐标不补偿", all(p["compensated"][1] == p["original"][1]
+                          for s in cr["sheets"] for p in s["pages"]))
+check("最外层补偿为 0", all(p["shift_mm"] == 0 for p in s1["pages"]))
+check("书脊中线不随补偿移动", left_p["spine_x_mm"] == left4["spine_x_mm"] == 108.0,
+      str(left_p["spine_x_mm"]))
+# 每张纸正反面共 pages_per_side×2 格；32 页 4 张共 32 个真实页格（每页印刷一次）
+check("页码逐页保留（含正反面）",
+      sorted(p["page"] for s in cr["sheets"] for p in s["pages"] if p["page"])
+      == list(range(1, 33)))
+check("每页恰好一个页格（正/反面合计）",
+      sum(1 for s in cr["sheets"] for p in s["pages"] if p["page"]) == 32)
+check("装订区以中线为中心", cr["binding_zone"][0]["center_x"] == 108.0
+      and cr["binding_zone"][0]["left"] == 105.0 and cr["binding_zone"][0]["right"] == 111.0)
+check("默认参数无诊断", cr["error_count"] == 0 and cr["warning_count"] == 0
+      and cr["diagnostics"] == [])
+check("含书口方向与公式说明", "书口" in cr["fore_edge_direction"] and "step" in cr["formula"])
+
+# 超限：0.5mm/张（×系数0.8 → 步距0.4）→ 第2张起 0.4/0.8/1.2 均 > max_offset=0.5
+r = post("/api/creep", src, spec, {**CREEP, "paper_thickness": 0.5})
+cr_over = r.json()
+check("补偿超限仍返回 200", r.status_code == 200)
+check("超限诊断 offset_exceeded",
+      any(d["code"] == "offset_exceeded" for d in cr_over["diagnostics"]))
+check("超限纸张逐张报告（步距0.4，第3/4张 0.8/1.2>0.5）",
+      sorted({d["sheet"] for d in cr_over["diagnostics"] if d["code"] == "offset_exceeded"})
+      == [3, 4])
+inner_pages = [p for p in cr_over["sheets"][3]["pages"] if p["page"] is not None]
+check("超限标注落到逐页诊断码", all("offset_exceeded" in p["diagnostics"] for p in inner_pages))
+check("第1张不超限", all("offset_exceeded" not in p["diagnostics"]
+                         for p in cr_over["sheets"][0]["pages"]))
+
+# 装订区越界：宽度超过纸张/相邻单元重叠
+r = post("/api/creep", src, spec, {**CREEP, "binding_width": 300})
+check("装订区越界诊断", r.status_code == 200
+      and any(d["code"] == "binding_out_of_bounds" for d in r.json()["diagnostics"]))
+big = {"finished_width": 105, "finished_height": 148, "sheet_width": 460, "sheet_height": 470,
+       "grain": "long_edge", "bleed": 3, "gripper": 10, "gripper_edge": "bottom",
+       "flip": "long_edge", "binding": "saddle"}
+r = post("/api/creep", src, big, {**CREEP, "plan_id": "rot0-4x2", "binding_width": 230})
+codes = {d["code"] for d in r.json()["diagnostics"]}
+check("多列相邻单元装订区重叠诊断", "binding_out_of_bounds" in codes, str(codes))
+
+# 正反面套准：正常方案 0 错位
+check("正反面套准无错位", not any(d["code"] == "register_mismatch" for d in cr["diagnostics"]))
+
+# 短边翻转：套准校核同样通过
+spec_se = {**spec, "flip": "short_edge", "grain": "short_edge"}
+r = post("/api/creep", src, spec_se, CREEP)
+check("短边翻转 creep 200 且无错位/越界", r.status_code == 200
+      and not any(d["code"] in ("register_mismatch", "out_of_printable")
+                  for d in r.json()["diagnostics"]), r.text[:200])
+# 短边翻转的背对背页：正面 (2,0)=32 绕短边翻转后对应背面 (0,0)=31，位移一致
+se = r.json()
+f00 = next(p for p in se["sheets"][0]["pages"] if p["side"] == "F" and p["row"] == 2 and p["col"] == 0)
+b10 = next(p for p in se["sheets"][0]["pages"] if p["side"] == "B" and p["row"] == 0 and p["col"] == 0)
+check("短边翻转背页配对(32↔31)", f00["page"] == 32 and b10["page"] == 31,
+      f"{f00['page']}↔{b10['page']}")
+check("短边翻转动纸张位移一致", abs(f00["shift_mm"]) == abs(b10["shift_mm"]))
+
+# 页面越出可印区域：左侧咬口 + 厚纸多帖，内层右页 -x 后带出血矩形进入咬口
+src96 = make_sample(96, out="/tmp/sample96.pdf")
+left_grip = {**spec, "gripper_edge": "left"}  # 长边纹正放，选 2×1 开数（24 张）
+r = post("/api/plans", src96, left_grip)
+pid_left = "rot0-2x1"
+r = post("/api/creep", src96, left_grip,
+         {"plan_id": pid_left, "paper_thickness": 5.0, "binding_width": 6, "max_offset": 500})
+check("左咬口厚纸大补偿 200", r.status_code == 200)
+oop = [d for d in r.json()["diagnostics"] if d["code"] == "out_of_printable"]
+check("页面越出可印区域诊断", bool(oop), str([d["code"] for d in r.json()["diagnostics"]][:8]))
+check("越界诊断指明可印区域", oop and "可印区域" in oop[0]["message"])
+check("越界诊断定位到纸张/正反面/页码",
+      all(d["sheet"] is not None and d["side"] and d["page"] is not None for d in oop))
+
+# 参数与装订方式校验
+r = post("/api/creep", src40, spec_p, CREEP)
+check("胶装拒绝爬移分析", r.status_code == 422)
+r = post("/api/creep", src, spec, {k: v for k, v in CREEP.items() if k != "binding_width"})
+check("缺装订区宽度返回 422", r.status_code == 422)
+r = post("/api/creep", src, spec, {**CREEP, "compression_factor": 0})
+check("压缩系数为 0 返回 422", r.status_code == 422)
+r = post("/api/creep", src, spec, {**CREEP, "plan_id": "no-such-plan"})
+check("不存在候选 ID 返回 404", r.status_code == 404)
+
+print("== 11. /api/ticket 与 /api/pdf 共用爬移参数 ==")
+r = post("/api/ticket", src, spec, CREEP)
+check("工单含 creep 段", r.status_code == 200 and r.json()["creep"] is not None)
+tk = r.json()
+check("工单 creep 与 /api/creep 同参（步距/逐张）",
+      tk["creep"]["step_mm"] == 0.08
+      and [s["creep_mm"] for s in tk["creep"]["sheets"]] == [0.0, 0.08, 0.16, 0.24])
+check("工单原 sheets 坐标不被修改",
+      all("creep" not in c for c in tk["sheets"][1]["front"]["cells"])
+      and tk["sheets"][1]["front"]["cells"][0]["x_mm"]
+      == best["sheets"][1]["front"]["cells"][0]["x_mm"])
+check("工单 creep 逐页含原/补偿坐标与诊断",
+      tk["creep"]["sheets"][1]["pages"][0]["original"] is not None
+      and "diagnostics" in tk["creep"]["sheets"][1]["pages"][0])
+
+r0 = post("/api/pdf", src, spec)
+r1 = post("/api/pdf", src, spec, CREEP)
+check("爬移 PDF 200", r1.status_code == 200, r1.text[:200])
+check("无爬移时 PDF 与基线一致", r0.content == post("/api/pdf", src, spec).content)
+out0 = PdfReader(io.BytesIO(r0.content))
+out1 = PdfReader(io.BytesIO(r1.content))
+s0 = out0.pages[2].get_contents().get_data()
+s1s = out1.pages[2].get_contents().get_data()
+# 第2张正面首格：trim 左缘 3.0→3.08mm；rotation=0 时合并页矩阵平移 e 直接在流中
+# 基线 e = 3mm = 8.50393701pt；补偿后 e = 3.08mm = 8.73070866pt（pypdf 保留 8 位小数）
+check("PDF 基线置入矩阵 x=8.50393701pt", b"8.50393701" in s0)
+check("PDF 按补偿坐标置入（x=8.73070866pt）",
+      b"8.73070866" in s1s and b"8.50393701" not in s1s)
+text = out1.pages[2].extract_text()
+check("PDF 标出爬移量", "爬移补偿 0.080mm" in text and "爬移 0.080mm" in text, text[:80])
+check("PDF 标出装订区与书口图例", "装订区边界" in text and "书口" in text)
+# 装订区边界 105/111mm 与书脊中线 108mm 同时在（坐标以 8 位小数写出）
+check("装订区边界线在 PDF 中",
+      f"{105 * 72 / 25.4:.4f}".encode() in s1s and f"{111 * 72 / 25.4:.4f}".encode() in s1s)
+check("书脊中线仍在原位（不随补偿移动）", f"{108 * 72 / 25.4:.4f}".encode() in s1s)
+check("下载文件名含爬移标识", "creep" in r1.headers["content-disposition"])
+open("/tmp/imposed_creep.pdf", "wb").write(r1.content)
+
+# 原候选不受预览/导出影响：重新枚举坐标与基线一致
+r2 = post("/api/plans", src, spec)
+check("预览/导出后原候选不变",
+      r2.json()["plans"][0]["sheets"][1]["front"]["cells"][0]["x_mm"]
+      == best["sheets"][1]["front"]["cells"][0]["x_mm"])
+
+# 未提供纸张厚度：保持现有拼版结果（PDF 字节一致）
+check("未提供厚度 PDF 字节一致", post("/api/pdf", src, spec).content == r0.content)
+tk_none = post("/api/ticket", src, spec).json()
+check("未提供厚度工单 creep=null", tk_none["creep"] is None)
+
+# 胶装提供爬移参数：忽略且 PDF 不变
+rp0 = post("/api/pdf", src40, spec_p).content
+rpc = post("/api/pdf", src40, spec_p, CREEP).content
+check("胶装 PDF 不受爬移参数影响", rp0 == rpc)
+tpc = post("/api/ticket", src40, spec_p, CREEP).json()
+check("胶装工单 creep=null", tpc["creep"] is None)
+
+# 只给部分爬移参数 → 422
+r = post("/api/ticket", src, spec, {"paper_thickness": 0.1})
+check("仅给厚度缺装订区参数返回 422", r.status_code == 422)
 
 print()
 if failures:
     print(f"共 {len(failures)} 项失败: {failures}")
     sys.exit(1)
-print("全部通过 ✔  样例输出: /tmp/imposed_saddle.pdf, /tmp/imposed_perfect.pdf, /tmp/imposed_mix.pdf")
+print("全部通过 ✔  样例输出: /tmp/imposed_saddle.pdf, /tmp/imposed_perfect.pdf, "
+      "/tmp/imposed_mix.pdf, /tmp/imposed_creep.pdf")

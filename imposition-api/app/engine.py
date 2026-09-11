@@ -81,10 +81,12 @@ def cut_counts(cols: int, rows: int) -> tuple[int, int]:
     return cols // 2, rows - 1
 
 
-def compute_mark_geometry(spec: JobSpec, side_cells: list[CellModel]) -> dict:
+def compute_mark_geometry(spec: JobSpec, side_cells: list[CellModel],
+                          fold_fixed: list[float] | None = None) -> dict:
     """由工单单元格 trim 位置计算标线几何（mm），工单与 PDF 共用，保证一致。
 
-    - fold_v：折页单元书脊中线（仅为折叠线，绝不作为裁切线）；
+    - fold_v：折页单元书脊中线（仅为折叠线，绝不作为裁切线）；爬移补偿时中线
+      物理位置不动，由 fold_fixed 显式传入，不能用补偿后单元格坐标反推；
     - cut_v：单元间纵向废边的两条边界（出血为 0 时合为一条）；
     - ext_v：纵向外部裁切线——拼版区出血外框右缘（版面靠左/侧规边对齐，
       左缘与纸边重合无需开刀），真正分隔印栏与废纸边；
@@ -97,8 +99,11 @@ def compute_mark_geometry(spec: JobSpec, side_cells: list[CellModel]) -> dict:
     bottoms = {cell.row: cell.y_mm for cell in side_cells}  # 各行 trim 下缘
     cols = sorted(lefts)
 
-    # 单元中线 = 奇数列（单元右格）的 trim 左缘
-    fold_v = sorted({lefts[c] for c in cols if c % 2 == 1})
+    # 单元中线 = 奇数列（单元右格）的 trim 左缘；爬移补偿时以固定中线为准
+    if fold_fixed is not None:
+        fold_v = sorted(round(x, 3) for x in fold_fixed)
+    else:
+        fold_v = sorted({lefts[c] for c in cols if c % 2 == 1})
 
     # 单元间隔处的裁切线：左单元 trim 右缘 + 右单元 trim 左缘（出血为 0 时重合去重）
     cut_v: list[float] = []

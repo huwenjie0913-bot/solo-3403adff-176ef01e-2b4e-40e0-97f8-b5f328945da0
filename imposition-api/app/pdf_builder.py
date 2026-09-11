@@ -8,6 +8,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen import canvas
 
+from .creep import CreepResponse, compensated_cells
 from .engine import compute_mark_geometry  # 共享几何：工单与 PDF 标线一致
 from .schemas import CellModel, JobSpec, PlanModel, SheetModel
 
@@ -22,9 +23,89 @@ def _pt(v_mm: float) -> float:
     return v_mm * MM
 
 
+def _draw_creep_annotations(c: canvas.Canvas, spec: JobSpec, plan: PlanModel,
+                            sheet: SheetModel, draw_cells: list[CellModel],
+                            orig_cells: list[CellModel],
+                            report: CreepResponse) -> None:
+    """校样上的爬移标注：装订区边界、书口方向、逐单元/逐张偏移量。"""
+    sm = next((s for s in report.sheets if s.index == sheet.index), None)
+    creep = sm.creep_mm if sm else 0.0
+    cw = draw_cells[0].w_mm
+    ch = draw_cells[0].h_mm
+    half = report.params.binding_width / 2.0
+    gy0 = min(cell.y_mm for cell in draw_cells)
+    gy1 = max(cell.y_mm for cell in draw_cells) + ch
+    ext = _pt(5)
+
+    # 装订区边界（蓝色点线，沿书脊中线两侧，伸出拼版区 5mm）
+    c.saveState()
+    c.setStrokeColorRGB(0.1, 0.25, 0.8)
+    c.setLineWidth(0.5)
+    c.setDash([2, 2], 0)
+    zone = {z["unit"]: z for z in report.binding_zone}
+    for cell in draw_cells:
+        if cell.col % 2 != 0:
+            continue
+        unit = cell.row * (plan.cols // 2) + cell.col // 2 + 1
+        z = zone.get(unit)
+        if not z:
+            continue
+        for bx in (z["left"], z["right"]):
+            xp = _pt(bx)
+            c.line(xp, _pt(gy0) - ext, xp, _pt(gy1) + ext)
+    c.restoreState()
+
+    # 书口方向：最上行每个单元外侧画箭头（左页书口朝左、右页书口朝右），
+    # 箭头取补偿后书口位置，直观看出补偿后书口内移
+    c.saveState()
+    c.setStrokeColorRGB(0.85, 0.35, 0.0)
+    c.setFillColorRGB(0.85, 0.35, 0.0)
+    c.setLineWidth(0.6)
+    c.setFont(CJK, 6)
+    top_row = max(cc.row for cc in draw_cells)
+    ay = _pt(gy1) + _pt(9)
+    arr = _pt(2.2)
+    for cell in draw_cells:
+        if cell.row != top_row:
+            continue
+        # 左页书口在 trim 左缘，右页书口在 trim 右缘（补偿后均向书脊中线内移）
+        if cell.col % 2 == 0:
+            x = _pt(cell.x_mm)
+            c.line(x + arr, ay, x - arr, ay)
+            c.line(x - arr, ay, x - arr * 0.2, ay + arr * 0.4)
+            c.line(x - arr, ay, x - arr * 0.2, ay - arr * 0.4)
+            c.drawString(x - _pt(14), ay + _pt(2), "书口")
+        else:
+            x = _pt(cell.x_mm + cw)
+            c.line(x - arr, ay, x + arr, ay)
+            c.line(x + arr, ay, x + arr * 0.2, ay + arr * 0.4)
+            c.line(x + arr, ay, x + arr * 0.2, ay - arr * 0.4)
+            c.drawString(x + _pt(2), ay + _pt(2), "书口")
+    c.restoreState()
+
+    # 偏移量：在最下行每条书脊中线旁标注本张补偿量；为 0 时仍标注"爬移 0"
+    c.saveState()
+    c.setFillColorRGB(0.1, 0.25, 0.8)
+    c.setFont(CJK, 6)
+    folds = sorted(z["center_x"] for z in report.binding_zone if z["row"] == 0)
+    for fx in folds:
+        c.drawString(_pt(fx) + _pt(1.5), _pt(gy0) - _pt(8),
+                     f"爬移 {creep:.3f}mm")
+    c.restoreState()
+
+
 def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
-                side_cells: list[CellModel], side_name: str) -> bytes:
-    """绘制一张纸某一面的标记层：裁切线、套准标记、帖码、咬口、折叠线。"""
+                side_cells: list[CellModel], side_name: str,
+                draw_cells: list[CellModel] | None = None,
+                fold_fixed: list[float] | None = None,
+                creep_report: CreepResponse | None = None) -> bytes:
+    """绘制一张纸某一面的标记层：裁切线、套准标记、帖码、咬口、折叠线。
+
+    启用爬移补偿时 draw_cells 为补偿后单元格（页面/裁切标记按此绘制），
+    fold_fixed 为不随补偿移动的书脊中线，creep_report 提供装订区/偏移标注。
+    """
+    if draw_cells is None:
+        draw_cells = side_cells
     buf = io.BytesIO()
     sw, sh = _pt(spec.sheet_width), _pt(spec.sheet_height)
     c = canvas.Canvas(buf, pagesize=(sw, sh))
@@ -49,8 +130,8 @@ def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
     else:
         c.rect(sw - g, 0, g, sh, stroke=0, fill=1)
 
-    if side_cells:
-        geo = compute_mark_geometry(spec, side_cells)
+    if draw_cells:
+        geo = compute_mark_geometry(spec, draw_cells, fold_fixed=fold_fixed)
         gx0, gy0, gx1, gy1 = (_pt(v) for v in geo["bbox"])
 
         # 外框四角裁切角线（trim corner ticks）
@@ -88,6 +169,11 @@ def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
         c.setDash()
         c.setLineWidth(0.4)
 
+        # 爬移校样标注：装订区边界、书口方向、逐张偏移量
+        if creep_report is not None:
+            _draw_creep_annotations(c, spec, plan, sheet, draw_cells,
+                                    side_cells, creep_report)
+
         # 套准标记（十字+圆）：拼版区四边中点外侧
         reg_r = _pt(3)
         reg_off = _pt(6)
@@ -115,10 +201,18 @@ def _marks_page(spec: JobSpec, plan: PlanModel, sheet: SheetModel,
     sig_desc = ""
     if plan.signature_plan:
         sig_desc = f"·{plan.signature_plan[sheet.signature - 1].pages}页"
+    creep_desc = ""
+    if creep_report is not None:
+        sm = next((s for s in creep_report.sheets if s.index == sheet.index), None)
+        v = sm.creep_mm if sm else 0.0
+        creep_desc = (f"  爬移补偿 {v:.3f}mm（厚度{creep_report.params.paper_thickness:g}"
+                      f"×系数{creep_report.params.compression_factor:g}，装订区"
+                      f"{creep_report.params.binding_width:g}mm）；蓝点线=装订区边界 "
+                      f"橙箭头=书口方向；")
     label = (f"帖 {sheet.signature}/{plan.signatures}{sig_desc}  "
              f"张 {sheet.sheet_in_signature}/{sig_sheet_total}  "
              f"{side_cn}  {plan.cols}×{plan.rows}开 rot{plan.rotation}  "
-             f"flip={spec.flip.value}；实线=外部裁切 虚线=废边裁切 "
+             f"flip={spec.flip.value}；{creep_desc}实线=外部裁切 虚线=废边裁切 "
              f"点划线=折叠（先外部裁切，再沿中线折叠，中线禁裁）")
     c.drawString(_pt(8), _pt(spec.gripper) + _pt(2) if edge == "bottom" else _pt(2), label)
 
@@ -144,19 +238,32 @@ def _cell_ctm(cell: CellModel, bleed_pt: float, fw_pt: float, fh_pt: float) -> t
 
 
 def build_imposed_pdf(src_bytes: bytes, spec: JobSpec, plan: PlanModel,
-                      src_has_bleed: bool) -> bytes:
+                      src_has_bleed: bool, creep_report: CreepResponse | None = None) -> bytes:
+    """输出拼版 PDF。creep_report 非空时按补偿后坐标置入页面并加爬移校样标注。"""
     reader = PdfReader(io.BytesIO(src_bytes))
     src0 = reader.pages[0]
     fw_pt = float(src0.mediabox.width) - (2 * _pt(spec.bleed) if src_has_bleed else 0)
     fh_pt = float(src0.mediabox.height) - (2 * _pt(spec.bleed) if src_has_bleed else 0)
     bleed_pt = _pt(spec.bleed) if src_has_bleed else 0.0
 
+    # 书脊中线物理位置不随爬移移动：始终取原方案首面网格
+    fold_fixed = None
+    if creep_report is not None:
+        orig = plan.sheets[0].front.cells
+        fold_fixed = sorted({cell.x_mm for cell in orig if cell.col % 2 == 1})
+
     writer = PdfWriter()
     for sheet in plan.sheets:
         for side_name, side in (("F", sheet.front), ("B", sheet.back)):
+            draw_cells = side.cells
+            if creep_report is not None:
+                draw_cells = compensated_cells(creep_report, sheet.index,
+                                               side_name, side.cells)
             marks = PdfReader(io.BytesIO(
-                _marks_page(spec, plan, sheet, side.cells, side_name))).pages[0]
-            for cell in side.cells:
+                _marks_page(spec, plan, sheet, side.cells, side_name,
+                            draw_cells=draw_cells, fold_fixed=fold_fixed,
+                            creep_report=creep_report))).pages[0]
+            for cell in draw_cells:
                 if cell.page is None:
                     continue
                 ctm = _cell_ctm(cell, bleed_pt, fw_pt, fh_pt)

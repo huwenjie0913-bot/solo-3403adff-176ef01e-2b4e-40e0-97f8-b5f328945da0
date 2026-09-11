@@ -155,3 +155,65 @@ class PlansResponse(BaseModel):
     spec: JobSpec
     plans: list[PlanModel]
     rejections: list[RejectionModel]
+
+
+class CreepParams(BaseModel):
+    """骑马订爬移补偿参数（长度单位均为 mm）。
+
+    套帖模型：纸张由外向内 1→N 套叠，最外层不受压、补偿为 0；
+    每向内一张纸，沿书脊法向（拼版面内即水平方向、指向该纸书脊中线）多补偿一个步距。
+    步距 = 纸张厚度 × 压缩系数（套叠压紧后内层向外探出量按压缩系数折算）。
+    """
+
+    paper_thickness: float = Field(..., gt=0, description="单张纸厚度（mm/张）")
+    compression_factor: float = Field(default=1.0, gt=0, description="压缩系数（步距=厚度×系数）")
+    binding_width: float = Field(..., gt=0, description="装订区宽度（mm，以书脊中线为中心的骑订区总宽）")
+    max_offset: float = Field(..., gt=0, description="最大允许补偿偏移（mm），超过即诊断为超限")
+
+
+class CreepDiagnostic(BaseModel):
+    code: str            # offset_exceeded / out_of_printable / register_mismatch / binding_out_of_bounds
+    severity: str        # error / warning
+    sheet: Optional[int] = None       # 纸张序号（全局装订区类诊断为 null）
+    side: Optional[str] = None        # F / B（全局诊断为 null）
+    page: Optional[int] = None        # 页码（空白格/全局诊断为 null）
+    message: str
+
+
+class CreepPageModel(BaseModel):
+    sheet: int                          # 全局纸张序号（从 1 开始）
+    side: str                           # F=正面 / B=背面
+    row: int
+    col: int
+    page: Optional[int]                 # 空白页为 null
+    unit: int                           # 所属折页单元（从 1 开始，按列对、行编号）
+    spine_x_mm: float                   # 该页所靠书脊中线 x（不随补偿移动）
+    original: tuple[float, float]       # 补偿前 trim 框左下角 (x, y)
+    compensated: tuple[float, float]    # 补偿后 trim 框左下角 (x, y)
+    shift_mm: float                     # 沿书脊法向的补偿量（向书脊为正，mm）
+    diagnostics: list[str]              # 本页命中的诊断码
+
+
+class CreepSheetModel(BaseModel):
+    index: int                          # 全局纸张序号（1 = 最外层）
+    nesting: int                        # 套帖层位（1 = 最外层，越大越靠内）
+    creep_mm: float                     # 本张步距累加值（本张各页法向补偿量）
+    pages: list[CreepPageModel]
+    diagnostics: list[CreepDiagnostic]
+
+
+class CreepResponse(BaseModel):
+    source: dict
+    spec: JobSpec
+    plan_id: str
+    params: CreepParams
+    sheets_total: int
+    step_mm: float                      # 每向内一张纸的补偿步距
+    fore_edge_direction: str            # 书口相对书脊的方向（拼版面内）
+    binding_zone: list[dict]            # 逐折页单元装订区 {unit,row,center_x,left,right}
+    sheets: list[CreepSheetModel]
+    diagnostics: list[CreepDiagnostic]
+    error_count: int
+    warning_count: int
+    formula: str
+    notes: list[str]
